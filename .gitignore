@@ -1,0 +1,31 @@
+# Logs
+*.log
+CloudPCReplace_Logs/
+
+# Export files (generated at runtime)
+CloudPC-Replace-Summary-*.csv
+
+# PowerShell artifacts
+*.ps1xml
+*.psd1
+
+# Windows artifacts
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# IDE files
+.vscode/
+.vs/
+*.suo
+*.user
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
