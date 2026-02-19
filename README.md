@@ -4,12 +4,16 @@ A PowerShell GUI tool that automates replacing Windows 365 Cloud PCs using diffe
 
 > ⚠️ **Community Tool** - This is an unsupported side project. Use at your own risk and test thoroughly before production use.
 
+<a href="img/screenshot.png"><img src="img/screenshot.png" alt="Cloud PC Replace Tool Screenshot" width="800"></a>
+
+*Real-time monitoring with status grid, queue management, and verbose logging*
+
 ## Problem Statement
 
 This tool automates replacing a user's Cloud PC from one provisioning profile to another by managing Microsoft Entra ID group memberships.
 
 Organizations may need to replace their users' Enterprise Cloud PCs to use a different provisioning policy but face various challenges:
-- Cannot provision both two Enterprise Cloud PCs simultaneously using different Provisioning Policies (1 License : 1 Policy)
+- A single Windows 365 license only supports one provisioning policy at a time — you can't run two Enterprise Cloud PCs from different provisioning policies side by side
 - Manual process requires admin babysitting through multiple stages (demands attention)
 - Need to wait for grace periods and provisioning to complete (time consuming)
 - Risk of errors during manual group membership changes (tedious!)
@@ -58,10 +62,6 @@ This tool can be used to deprovision an existing Enterprise Cloud PC and then pr
 - ✅ **Multiple CPC Handling** - Detects and manages users with multiple Cloud PCs
 - ✅ **Parallel Processing** - Process multiple users simultaneously
 - ✅ **Comprehensive Logging** - Timestamped, color-coded logs
-
-<a href="img/screenshot.png"><img src="img/screenshot.png" alt="Cloud PC Replace Tool Screenshot" width="800"></a>
-
-*Real-time monitoring with status grid, queue management, and verbose logging*
 
 ## Prerequisites
 
