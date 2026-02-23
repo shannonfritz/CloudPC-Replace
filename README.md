@@ -13,7 +13,7 @@ A PowerShell GUI tool that automates replacing Windows 365 Cloud PCs using diffe
 This tool automates replacing a user's Cloud PC from one provisioning profile to another by managing Microsoft Entra ID group memberships.
 
 Organizations may need to replace their users' Enterprise Cloud PCs to use a different provisioning policy but face various challenges:
-- A single Windows 365 license only supports one provisioning policy at a time — you can't run two Enterprise Cloud PCs from different provisioning policies side by side
+- Windows 365 Enterprise licenses only support one provisioning policy at a time — you can't run two Enterprise Cloud PCs from different provisioning policies side by side (although you can have multiple different sized Cloud PCs from the same policy)
 - Manual process requires admin babysitting through multiple stages (demands attention)
 - Need to wait for grace periods and provisioning to complete (time consuming)
 - Risk of errors during manual group membership changes (tedious!)
@@ -264,32 +264,26 @@ Install-Module Microsoft.Graph -Scope CurrentUser -Force
 - The job will complete successfully
 
 ### "Multiple CPCs detected (X)"
-- User has more than one Cloud PC
+- User has more than one Cloud PC (multiple licenses for the same policy)
 - This is a warning - the tool will track all CPCs
 - All CPCs from the source group will be deprovisioned
-- Only one new CPC will provision in the target group
+- New CPCs from the target group will provision for each licnese 
 
 ### "Timeout waiting for grace period"
 - The Cloud PC may already be deprovisioned
 - Check Cloud PC status in Windows 365 portal
-- Consider increasing `GracePeriodTimeoutMinutes` in config
+- Consider increasing `GracePeriodTimeoutMinutes` from default
 
 ### "Timeout waiting for provisioning"
-- Provisioning can take 30-60 minutes for large CPCs
+- Provisioning can take 30-60 minutes and can vary
 - Check Windows 365 portal for provisioning errors
 - Verify the provisioning policy is correctly configured
-- Consider increasing `ProvisioningTimeoutMinutes` in config
+- Consider increasing `ProvisioningTimeoutMinutes` from default
 
 ### Jobs not starting when queue has room
 - Check **Max Concurrent** setting - may be too low
 - Verify jobs are in "Queued" status (gray) not already "InProgress"
 - Click **Start Processing** if you've stopped the queue
-
-### Cannot modify queue while running
-- You can add new jobs at any time
-- You can remove/reorder jobs that are "Queued" (gray)
-- You cannot modify jobs that are "Active" or "Monitoring"
-- Use **Stop Processing** to pause before making changes to active jobs
 
 ## Advanced Usage
 
