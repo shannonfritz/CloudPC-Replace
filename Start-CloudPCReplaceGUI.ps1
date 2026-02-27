@@ -1211,9 +1211,10 @@ function Show-ReplaceGUI {
             # if ($sortedGroups.Count -gt 0) { $sortedGroups[0].onPremisesSyncEnabled = $true }
             
             foreach ($group in $sortedGroups) {
-                # Create a display string with warning for AD-synced groups
+                # Create a display string with warning for AD-synced or dynamic groups
                 $adSyncWarning = if ($group.onPremisesSyncEnabled -eq $true) { " *!AD-Synced!*" } else { "" }
-                $item = $group.displayName + $adSyncWarning + " (" + $group.id + ")"
+                $dynamicWarning = if ($group.groupTypes -and $group.groupTypes -contains 'DynamicMembership') { " *!Dynamic!*" } else { "" }
+                $item = $group.displayName + $adSyncWarning + $dynamicWarning + " (" + $group.id + ")"
                 $lstGroupsSource.Items.Add($item) | Out-Null
                 # Store the actual group hashtable for retrieval later
                 $groupArray.Add($group) | Out-Null
@@ -1250,9 +1251,10 @@ function Show-ReplaceGUI {
             # if ($sortedGroups.Count -gt 0) { $sortedGroups[0].onPremisesSyncEnabled = $true }
             
             foreach ($group in $sortedGroups) {
-                # Create a display string with warning for AD-synced groups
+                # Create a display string with warning for AD-synced or dynamic groups
                 $adSyncWarning = if ($group.onPremisesSyncEnabled -eq $true) { " *!AD-Synced!*" } else { "" }
-                $item = $group.displayName + $adSyncWarning + " (" + $group.id + ")"
+                $dynamicWarning = if ($group.groupTypes -and $group.groupTypes -contains 'DynamicMembership') { " *!Dynamic!*" } else { "" }
+                $item = $group.displayName + $adSyncWarning + $dynamicWarning + " (" + $group.id + ")"
                 $lstGroupsTarget.Items.Add($item) | Out-Null
                 # Store the actual group hashtable for retrieval later
                 $groupArray.Add($group) | Out-Null
@@ -1283,6 +1285,23 @@ function Show-ReplaceGUI {
                     "SOLUTION: Create a cloud-only group in Microsoft Entra ID and assign your Cloud PC provisioning policy to it instead.`n`n" +
                     "See README for details on group requirements.",
                     "AD-Synced Group Not Supported",
+                    "OK",
+                    "Warning"
+                )
+                $lstGroupsSource.ClearSelected()
+                $script:sourceGroupId = $null
+                return
+            }
+
+            # Validate group is not a dynamic group
+            if ($selectedGroup.groupTypes -and $selectedGroup.groupTypes -contains 'DynamicMembership') {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Cannot Use Dynamic Group`n`n" +
+                    "The selected group '$($selectedGroup.displayName)' is a Dynamic Membership group. Membership is controlled by rules and cannot be modified manually via Microsoft Graph API.`n`n" +
+                    "This tool requires Assigned (static) Entra Cloud Groups where membership can be changed programmatically.`n`n" +
+                    "SOLUTION: Create an Assigned (static) cloud-only group in Microsoft Entra ID and assign your Cloud PC provisioning policy to it instead.`n`n" +
+                    "See README for details on group requirements.",
+                    "Dynamic Group Not Supported",
                     "OK",
                     "Warning"
                 )
@@ -1348,6 +1367,23 @@ function Show-ReplaceGUI {
                     "SOLUTION: Create a cloud-only group in Microsoft Entra ID and assign your Cloud PC provisioning policy to it instead.`n`n" +
                     "See README for details on group requirements.",
                     "AD-Synced Group Not Supported",
+                    "OK",
+                    "Warning"
+                )
+                $lstGroupsTarget.ClearSelected()
+                $script:targetGroupId = $null
+                return
+            }
+
+            # Validate group is not a dynamic group
+            if ($selectedGroup.groupTypes -and $selectedGroup.groupTypes -contains 'DynamicMembership') {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Cannot Use Dynamic Group`n`n" +
+                    "The selected group '$($selectedGroup.displayName)' is a Dynamic Membership group. Membership is controlled by rules and cannot be modified manually via Microsoft Graph API.`n`n" +
+                    "This tool requires Assigned (static) Entra Cloud Groups where membership can be changed programmatically.`n`n" +
+                    "SOLUTION: Create an Assigned (static) cloud-only group in Microsoft Entra ID and assign your Cloud PC provisioning policy to it instead.`n`n" +
+                    "See README for details on group requirements.",
+                    "Dynamic Group Not Supported",
                     "OK",
                     "Warning"
                 )
@@ -2494,7 +2530,8 @@ function Process-UserState {
                         $State.Status = "Warning"
                         $State.Stage = "Monitoring Stopped"
                         $State.EndTime = Get-Date
-                        $State.FinalMessage = "Provisioning exceeded $script:provisioningTimeoutMinutes min - monitoring stopped but provisioning may still complete"`n                        $State.NextPollDisplay = "-"
+                        $State.FinalMessage = "Provisioning exceeded $script:provisioningTimeoutMinutes min - monitoring stopped but provisioning may still complete"
+`n                        $State.NextPollDisplay = "-"
                         
                         Write-StatusLog "[WARNING] $($State.UserPrincipalName): Provisioning exceeded timeout ($script:provisioningTimeoutMinutes min) - stopping monitoring" -Color Yellow
                         Write-InfoLog "[INFO] Provisioning may still complete in the background" "Cyan"
@@ -2517,7 +2554,8 @@ function Process-UserState {
                         $State.Status = "Warning"
                         $State.Stage = "Monitoring Stopped"
                         $State.EndTime = Get-Date
-                        $State.FinalMessage = "Provisioning exceeded $script:provisioningTimeoutMinutes min - monitoring stopped but provisioning may still complete"`n                        $State.NextPollDisplay = "-"
+                        $State.FinalMessage = "Provisioning exceeded $script:provisioningTimeoutMinutes min - monitoring stopped but provisioning may still complete"
+`n                        $State.NextPollDisplay = "-"
                         
                         Write-StatusLog "[WARNING] $($State.UserPrincipalName): Provisioning exceeded timeout ($script:provisioningTimeoutMinutes min) - stopping monitoring" -Color Yellow
                         Write-InfoLog "[INFO] Provisioning may still complete in the background" "Cyan"
@@ -2542,7 +2580,8 @@ function Process-UserState {
         $State.Status = "Failed"
         $State.ErrorMessage = $_.Exception.Message
         $State.EndTime = Get-Date
-        $State.FinalMessage = $State.ErrorMessage`n        $State.NextPollDisplay = "-"
+        $State.FinalMessage = $State.ErrorMessage
+`n        $State.NextPollDisplay = "-"
         
         Write-Host "`n[ERROR] $($State.UserPrincipalName) FAILED" -ForegroundColor Red
         Write-Host "  Stage: $($State.Stage)" -ForegroundColor Yellow

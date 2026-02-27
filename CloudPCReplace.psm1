@@ -431,7 +431,7 @@ function Find-EntraIDGroups {
         # Use $search parameter which supports partial matching (requires ConsistencyLevel header)
         # Search format: "displayName:searchterm" matches groups containing the term
         $searchQuery = "displayName:$SearchTerm"
-        $uri = 'https://graph.microsoft.com/v1.0/groups?$search=' + [System.Web.HttpUtility]::UrlEncode('"' + $searchQuery + '"') + '&$select=id,displayName,description,onPremisesSyncEnabled&$top=100&$count=true'
+        $uri = 'https://graph.microsoft.com/v1.0/groups?$search=' + [System.Web.HttpUtility]::UrlEncode('"' + $searchQuery + '"') + '&$select=id,displayName,description,onPremisesSyncEnabled,groupTypes&$top=100&$count=true'
         
         $allGroups = @()
         
