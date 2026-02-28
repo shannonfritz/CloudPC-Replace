@@ -41,9 +41,12 @@ This tool can be used to deprovision an existing Enterprise Cloud PC and then pr
 
 ## Features
 
-### Current Version (v4.2)
+### Current Version (v4.3)
 
-- ✅ **Pre-flight Validation** - Detects AD-synced groups and blocks selection with helpful error
+- ✅ **Modular Architecture** - Core logic in reusable PowerShell module
+- ✅ **Unified Logging** - 6-character aligned tags (Action/Detect/Info/Debug/Poll/API/OK/WARN/FAIL)
+- ✅ **Enhanced CPC Tracking** - Clear OLD/NEW CPC identification with IDs and names
+- ✅ **Pre-flight Validation** - Detects and blocks AD-synced and Dynamic groups with helpful errors
 - ✅ **Queue Management** - Add multiple jobs from different source/target groups
 - ✅ **Dynamic Concurrency** - Adjust concurrent jobs in real-time (1-40, default 2)
 - ✅ **Job Exports** - Auto-save daily CSV + manual export on-demand
@@ -85,11 +88,15 @@ Two Microsoft Entra ID groups configured for Cloud PC provisioning:
 - **Source Group** - Assigned to current provisioning policy
 - **Target Group** - Assigned to new/different provisioning policy
 
-> ⚠️ **IMPORTANT:** Groups **MUST be Entra Cloud Groups** (created in Microsoft Entra ID / Azure AD). 
+> ⚠️ **IMPORTANT:** Groups **MUST be Assigned (static) Entra Cloud Groups** (created in Microsoft Entra ID / Azure AD). 
 > 
-> ❌ **This tool CANNOT work with Active Directory synced groups** - Group memberships cannot be modified via Graph API for AD-synced groups. The script will fail when trying to add/remove users.
+> ❌ **This tool CANNOT work with:**
+> - **Active Directory synced groups** - Group memberships cannot be modified via Graph API for AD-synced groups
+> - **Dynamic groups** - Membership is controlled by rules and cannot be changed manually
 > 
-> ✅ **Use Cloud-only groups** - Groups where Microsoft Entra ID is the source of authority and members can be changed using Microsoft Graph.
+> ✅ **Use Assigned (static) cloud-only groups** - Groups where Microsoft Entra ID is the source of authority and members can be changed using Microsoft Graph.
+> 
+> The GUI will detect and warn you about AD-synced or Dynamic groups before you can use them.
 
 The GUI will let you search for groups by name - no need to look up Object IDs!
 
@@ -452,6 +459,42 @@ If you encounter issues:
 This tool is provided as-is. Use at your own risk.
 
 ## Version History
+
+### v4.3 (2026-02-27)
+
+**Refactored**
+- Core business logic extracted to `CloudPCReplace.psm1` module for reusability
+- `UserReplaceState` class moved to module (job state management)
+- `Get-StageDisplay` function moved to module (stage name formatting)
+- `Invoke-CloudPCReplaceStep` function (complete state machine, ~450 lines) moved to module with callback pattern
+- Module now handles all Graph API calls and state transitions
+- GUI script reduced by ~584 lines, now focuses on UI concerns only
+
+**Changed**
+- Unified all logging tags to 6-character format for better alignment:
+  - State Machine (Cased): `[Action]`, `[Detect]`, `[Info  ]`, `[Debug ]`, `[Poll  ]`
+  - Module Helpers (CAPS): `[API   ]`, `[OK    ]`, `[WARN  ]`, `[FAIL  ]`
+  - GUI-Specific: `[Search]`, `[Group ]`
+- Enhanced CPC identity logging (OLD/NEW labels always visible, not just in verbose mode)
+- CPC tracking now shows full details: `OLD: CPC-name | ID: xxx | Plan: xxx`
+- Deprovisioning completion now logs which CPCs were deprovisioned
+- New CPC provisioning now logs: `NEW: CPC-name | ID: xxx | Plan: xxx`
+
+**Added**
+- Comprehensive debug logging for CPC ID tracking throughout workflow
+- Logging when old CPC IDs are captured, cleared, and compared
+- Code comments documenting Azure's Cloud PC GUID reuse behavior
+- Test suite (`Test-Refactoring.ps1`) with 9 automated tests validating module integration
+- Documentation for Dynamic group detection and validation (feature existed but was undocumented)
+
+**Fixed**
+- CPC completion detection (Azure reuses same cloudPcId GUID when reprovisioning)
+- Clearing `CloudPCIds` array after deprovision ensures new CPC detection works correctly
+
+**Technical**
+- Module uses callback pattern (`OnLog`, `OnGridUpdate`) to stay UI-agnostic
+- Ready for WPF GUI implementation (can reuse same module)
+- PowerShell class support requires `using module` directive (not just `Import-Module`)
 
 ### v4.2 (2026-02-18)
 

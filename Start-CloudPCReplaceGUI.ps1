@@ -4,7 +4,7 @@ using module .\CloudPCReplace.psm1
 
 # Version - Single source of truth
 # TO UPDATE VERSION: Change this one value and it updates everywhere (title bar, docs, etc.)
-$script:ToolVersion = "4.2.0"
+$script:ToolVersion = "4.3.0"
 
 <#
 .SYNOPSIS
@@ -24,20 +24,15 @@ $script:ToolVersion = "4.2.0"
 
 .NOTES
     Author: Cloud PC Replace Tool
-    Version: 4.1.0
-    Date: 2026-02-14
+    Version: 4.3.0
+    Date: 2026-02-27
     
-    Changelog v4.1 (Production Release):
-    - Job summary CSV export (auto-save daily + manual export)
-    - Verbose logging toggle with standardized helpers
-    - Complete timestamp standardization ([HH:mm:ss])
-    - NextPoll display architecture (single source of truth)
-    - Ending Grace Period now waits for deprovision confirmation
-    - API throttling optimization (3min monitoring, 1min active stages)
-    - Multi-CPC job history (separate CSV rows per CPC)
-    - Pagination support for large groups (800+ users)
-    - Case-insensitive sorting for groups and users
-    - Clear Queue bug fix (index out of range)
+    Changelog v4.3 (Modular Refactoring):
+    - Core business logic moved to module for code reuse
+    - Unified 6-character logging tags (Action/Detect/Info/Debug/Poll)
+    - Enhanced CPC identity tracking with OLD/NEW labels
+    - Improved debug logging for troubleshooting
+    - Module architecture ready for WPF GUI development
     - Deprovision skip bug fix (CRITICAL - license reuse)
     - Timeout adjustments (60/60/90 min with Warning state)
     - Configuration change logging
@@ -355,40 +350,6 @@ function Save-JobSummaryAuto {
 }
 #endregion
 
-#region User State Class
-class UserReplaceState {
-    [string]$UserPrincipalName
-    [string]$UserId
-    [string]$SourceGroupId        # Each job has its own source
-    [string]$SourceGroupName      # For display in grid
-    [string]$TargetGroupId        # Each job has its own target
-    [string]$TargetGroupName      # For display in grid
-    [array]$SourcePolicyIds       # Cached provisioning policy IDs for this job's source group
-    [array]$TargetPolicyIds       # Cached provisioning policy IDs for this job's target group
-    [string]$Stage
-    [string]$Status  # Queued, InProgress, Success, Failed
-    [int]$ProgressPercent
-    [datetime]$StartTime
-    [datetime]$StageStartTime
-    [datetime]$LastPollTime
-    [datetime]$EndTime
-    [string]$ErrorMessage
-    [array]$OldCPCs = @()         # Array of hashtables: @{Id, Name, ServicePlan}
-    [array]$NewCPCs = @()         # Array of hashtables: @{Id, Name, ServicePlan}
-    [array]$CloudPCIds     # DEPRECATED - kept for backward compat, use OldCPCs instead
-    [array]$GraceEndedCPCIds  # Track which CPCs we've already ended grace on
-    [hashtable]$DeprovisioningSeenCPCs = @{}  # Track which CPCs have reached 'deprovisioning' status
-    [int]$GridRowIndex
-    [int]$QueueOrder = 0  # Lower number = higher priority
-    [string]$NextPollDisplay = "-"  # Pre-calculated display value for NextPoll column
-    
-    # Summary fields for CSV export
-    [string]$OldCPCName = ""
-    [string]$NewCPCName = ""
-    [string]$FinalMessage = ""
-}
-#endregion
-
 #region Helper Functions
 # Helper function to update NextPoll display value based on state
 function Update-NextPollDisplay {
@@ -434,30 +395,6 @@ function Update-NextPollDisplay {
         # Other stages (shouldn't normally see these, but fallback)
         $State.NextPollDisplay = "$([math]::Round($secondsUntilNextPoll))s"
     }
-}
-
-# Helper function to format stage with step number
-function Get-StageDisplay {
-    param([string]$Stage)
-    
-    $stageMap = @{
-        'Queued' = '1/9'
-        'Getting User Info' = '2/9'
-        'Getting Current Cloud PC' = '3/9'
-        'Removing from Source' = '4/9'
-        'Waiting for Grace Period' = '5/9'
-        'Ending Grace Period' = '6/9'
-        'Waiting for Deprovision' = '7/9'
-        'Adding to Target' = '8/9'
-        'Waiting for Provisioning' = '9/9'
-        'Complete' = 'Done'
-    }
-    
-    $prefix = $stageMap[$Stage]
-    if ($prefix) {
-        return $prefix + ' - ' + $Stage
-    }
-    return $Stage
 }
 #endregion
 
@@ -1083,8 +1020,71 @@ function Show-ReplaceGUI {
                 
                 # Is it time to process this user?
                 if ($isImmediateStage -or $secondsSinceLastPoll -ge $pollInterval) {
-                    Process-UserState -State $state -GridStatus $script:GridStatus
+                    # Call module function with callbacks
+                    $timeouts = @{
+                        GracePeriodTimeout = $script:gracePeriodTimeoutMinutes
+                        EndingGracePeriodTimeout = $script:endingGracePeriodTimeoutMinutes
+                        DeprovisionTimeout = $script:deprovisionTimeoutMinutes
+                        ProvisioningTimeout = $script:provisioningTimeoutMinutes
+                    }
+                    
+                    $onLog = {
+                        param($Message, $Level, $Color)
+                        switch ($Level) {
+                            "Status" { Write-StatusLog $Message -Color $Color }
+                            "Info" { Write-InfoLog $Message $Color }
+                            "Debug" { Write-DebugLog $Message $Color }
+                            "Polling" { Write-PollingLog $Message $Color }
+                            "Verbose" { Write-VerboseLog $Message $Color }
+                            default { Write-Host $Message -ForegroundColor $Color }
+                        }
+                    }
+                    
+                    $onGridUpdate = {
+                        param($State, $ColumnName, $Value)
+                        if ($State.GridRowIndex -ge 0 -and $State.GridRowIndex -lt $script:GridStatus.Rows.Count) {
+                            $script:GridStatus.Rows[$State.GridRowIndex].Cells[$ColumnName].Value = $Value
+                        }
+                    }
+                    
+                    Invoke-CloudPCReplaceStep -State $state -Timeouts $timeouts -OnLog $onLog -OnGridUpdate $onGridUpdate
                     $state.LastPollTime = $now
+                    
+                    # Update grid with new state values (stage, status, messages)
+                    $displayStatus = if ($state.Status -eq "InProgress") {
+                        if ($state.Stage -eq "Waiting for Provisioning") { "Monitoring" } else { "Active" }
+                    } else {
+                        $state.Status
+                    }
+                    
+                    $script:GridStatus.Rows[$state.GridRowIndex].Cells["Stage"].Value = Get-StageDisplay $state.Stage
+                    $script:GridStatus.Rows[$state.GridRowIndex].Cells["Status"].Value = $displayStatus
+                    
+                    if ($state.ErrorMessage) {
+                        $script:GridStatus.Rows[$state.GridRowIndex].Cells["Messages"].Value = $state.ErrorMessage
+                    }
+                    
+                    # Update row color based on status
+                    $color = switch ($state.Status) {
+                        "Success" { [System.Drawing.Color]::LightGreen }
+                        "Success (Warnings)" { [System.Drawing.Color]::LightYellow }
+                        "Failed" { [System.Drawing.Color]::LightCoral }
+                        "Warning" { [System.Drawing.Color]::Orange }
+                        "InProgress" {
+                            if ($state.Stage -eq "Waiting for Provisioning") {
+                                [System.Drawing.Color]::LightCyan
+                            } else {
+                                [System.Drawing.Color]::LightBlue
+                            }
+                        }
+                        default { [System.Drawing.Color]::White }
+                    }
+                    $script:GridStatus.Rows[$state.GridRowIndex].DefaultCellStyle.BackColor = $color
+                    
+                    # If job completed, save summary
+                    if ($state.Status -in @("Success", "Success (Warnings)", "Failed", "Warning")) {
+                        Save-JobSummaryAuto -State $state
+                    }
                 }
                 
                 # Update the NextPoll display value based on current state
@@ -1198,7 +1198,7 @@ function Show-ReplaceGUI {
         $chkUsersSource.Items.Clear()
         $lstGroupsSource.Tag = $null
         
-        Write-StatusLog "[SEARCH] Searching source groups for: '$($txtSearchSource.Text)'" -Color Cyan
+        Write-StatusLog "[Search] Searching source groups for: '$($txtSearchSource.Text)'" -Color Cyan
         
         try {
             $groups = Find-EntraIDGroups -SearchTerm $txtSearchSource.Text
@@ -1221,10 +1221,10 @@ function Show-ReplaceGUI {
             }
             
             $lstGroupsSource.Tag = $groupArray.ToArray()
-            Write-StatusLog "[SEARCH] Found $($groups.Count) group(s) matching '$($txtSearchSource.Text)'" -Color Green
+            Write-StatusLog "[Search] Found $($groups.Count) group(s) matching '$($txtSearchSource.Text)'" -Color Green
         }
         catch {
-            Write-StatusLog "[SEARCH] Error searching for '$($txtSearchSource.Text)': $_" -Color Red
+            Write-StatusLog "[Search] Error searching for '$($txtSearchSource.Text)': $_" -Color Red
         }
         finally {
             $btnSearchSource.Enabled = $true
@@ -1238,7 +1238,7 @@ function Show-ReplaceGUI {
         $lstGroupsTarget.Items.Clear()
         $lstGroupsTarget.Tag = $null
         
-        Write-StatusLog "[SEARCH] Searching target groups for: '$($txtSearchTarget.Text)'" -Color Cyan
+        Write-StatusLog "[Search] Searching target groups for: '$($txtSearchTarget.Text)'" -Color Cyan
         
         try {
             $groups = Find-EntraIDGroups -SearchTerm $txtSearchTarget.Text
@@ -1261,10 +1261,10 @@ function Show-ReplaceGUI {
             }
             
             $lstGroupsTarget.Tag = $groupArray.ToArray()
-            Write-StatusLog "[SEARCH] Found $($groups.Count) group(s) matching '$($txtSearchTarget.Text)'" -Color Green
+            Write-StatusLog "[Search] Found $($groups.Count) group(s) matching '$($txtSearchTarget.Text)'" -Color Green
         }
         catch {
-            Write-StatusLog "[SEARCH] Error searching for '$($txtSearchTarget.Text)': $_" -Color Red
+            Write-StatusLog "[Search] Error searching for '$($txtSearchTarget.Text)': $_" -Color Red
         }
         finally {
             $btnSearchTarget.Enabled = $true
@@ -1314,8 +1314,8 @@ function Show-ReplaceGUI {
             $chkUsersSource.Items.Clear()
             $txtSearchUsers.Clear()
             
-            Write-StatusLog "[GROUP] Loading members from '$($selectedGroup.DisplayName)'..." -Color Cyan
-            Write-StatusLog "[API] GET /groups/$($script:sourceGroupId)/members" -Color Yellow
+            Write-StatusLog "[Group ] Loading members from '$($selectedGroup.DisplayName)'..." -Color Cyan
+            Write-StatusLog "[API   ] GET /groups/$($script:sourceGroupId)/members" -Color Yellow
             
             try {
                 $members = Get-GroupMembers -GroupId $script:sourceGroupId
@@ -1344,10 +1344,10 @@ function Show-ReplaceGUI {
                     $chkUsersSource.Items.Add($userObj) | Out-Null
                 }
                 $lblUsersSource.Text = "Users: $($script:allSourceUsers.Count) | Selected: 0"
-                Write-StatusLog "[GROUP] Loaded $($script:allSourceUsers.Count) user(s) from '$($selectedGroup.DisplayName)'" -Color Green
+                Write-StatusLog "[Group ] Loaded $($script:allSourceUsers.Count) user(s) from '$($selectedGroup.DisplayName)'" -Color Green
             }
             catch {
-                Write-StatusLog "[GROUP] Error loading members: $_" -Color Red
+                Write-StatusLog "[Group ] Error loading members: $_" -Color Red
                 $script:allSourceUsers = @()
             }
         }
@@ -1393,7 +1393,7 @@ function Show-ReplaceGUI {
             }
             
             $script:targetGroupId = $selectedGroup.Id
-            Write-StatusLog "[GROUP] Target group selected: '$($selectedGroup.DisplayName)'" -Color Cyan
+            Write-StatusLog "[Group ] Target group selected: '$($selectedGroup.DisplayName)'" -Color Cyan
             
             # Enable Start button if we have source, target, and checked users
             if (-not $script:replaceRunning) {
@@ -2707,5 +2707,8 @@ if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
 Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
 Show-ReplaceGUI
+
+
+
 
 

@@ -29,3 +29,6 @@ $RECYCLE.BIN/
 # Temporary files
 *.tmp
 *.temp
+
+# Development test files
+Test-Refactoring.ps1

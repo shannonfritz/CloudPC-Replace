@@ -44,7 +44,7 @@ function Write-InfoLog {
 function Write-ApiLog {
     param([string]$Message, [string]$Color = "Yellow")
     $timestamp = Get-Date -Format "HH:mm:ss"
-    Write-Host "[$timestamp] $Message" -ForegroundColor $Color
+    Write-Host "[$timestamp] [API   ] $Message" -ForegroundColor $Color
 }
 #endregion
 
@@ -60,6 +60,38 @@ class ReplaceStatus {
     [string]$CloudPCId  # Legacy - keeping for backwards compat
     [array]$CloudPCIds  # Array of CPC IDs to track
     [int]$ProgressPercent
+}
+
+class UserReplaceState {
+    [string]$UserPrincipalName
+    [string]$UserId
+    [string]$SourceGroupId        # Each job has its own source
+    [string]$SourceGroupName      # For display in grid
+    [string]$TargetGroupId        # Each job has its own target
+    [string]$TargetGroupName      # For display in grid
+    [array]$SourcePolicyIds       # Cached provisioning policy IDs for this job's source group
+    [array]$TargetPolicyIds       # Cached provisioning policy IDs for this job's target group
+    [string]$Stage
+    [string]$Status  # Queued, InProgress, Success, Failed
+    [int]$ProgressPercent
+    [datetime]$StartTime
+    [datetime]$StageStartTime
+    [datetime]$LastPollTime
+    [datetime]$EndTime
+    [string]$ErrorMessage
+    [array]$OldCPCs = @()         # Array of hashtables: @{Id, Name, ServicePlan}
+    [array]$NewCPCs = @()         # Array of hashtables: @{Id, Name, ServicePlan}
+    [array]$CloudPCIds     # DEPRECATED - kept for backward compat, use OldCPCs instead
+    [array]$GraceEndedCPCIds  # Track which CPCs we've already ended grace on
+    [hashtable]$DeprovisioningSeenCPCs = @{}  # Track which CPCs have reached 'deprovisioning' status
+    [int]$GridRowIndex
+    [int]$QueueOrder = 0  # Lower number = higher priority
+    [string]$NextPollDisplay = "-"  # Pre-calculated display value for NextPoll column
+    
+    # Summary fields for CSV export
+    [string]$OldCPCName = ""
+    [string]$NewCPCName = ""
+    [string]$FinalMessage = ""
 }
 #endregion
 
@@ -86,7 +118,7 @@ function Connect-MgGraphForReplace {
     )
     
     try {
-        Write-Log "Connecting to Microsoft Graph..." -Level Info
+        Write-Log "Connecting to Microsoft Graph..." -Level 'Info  '
         
         $connectParams = @{
             Scopes = $requiredScopes
@@ -111,12 +143,12 @@ function Connect-MgGraphForReplace {
         $tenantInfo = if ($context.TenantId) { $context.TenantId } else { "Unknown" }
         $accountInfo = if ($context.Account) { $context.Account } else { "Unknown" }
         
-        Write-Log "Connected to tenant: $tenantInfo (Account: $accountInfo)" -Level Success
+        Write-Log "Connected to tenant: $tenantInfo (Account: $accountInfo)" -Level 'OK    '
         
         return $true
     }
     catch {
-        Write-Log "Failed to connect to Microsoft Graph: $_" -Level Error
+        Write-Log "Failed to connect to Microsoft Graph: $_" -Level 'FAIL  '
         return $false
     }
 }
@@ -174,7 +206,7 @@ function Get-CloudPCForUser {
         return @()
     }
     catch {
-        Write-Log "Error getting Cloud PC for user $UserId : $_" -Level Error
+        Write-Log "Error getting Cloud PC for user $UserId : $_" -Level 'FAIL  '
         throw
     }
 }
@@ -210,7 +242,7 @@ function Get-UserGroupMemberships {
         return $allGroups
     }
     catch {
-        Write-Log "Error getting group memberships for user $UserId : $_" -Level Error
+        Write-Log "Error getting group memberships for user $UserId : $_" -Level 'FAIL  '
         return @()
     }
 }
@@ -266,7 +298,7 @@ function Get-ProvisioningPoliciesForGroup {
     catch {
         $timestamp = Get-Date -Format "HH:mm:ss"
         Write-Host "[$timestamp] [ERROR] Error getting provisioning policies: $_" -ForegroundColor Red
-        Write-Log "Error getting provisioning policies for group $GroupId : $_" -Level Error
+        Write-Log "Error getting provisioning policies for group $GroupId : $_" -Level 'FAIL  '
         return @()
     }
 }
@@ -287,17 +319,17 @@ function Stop-CloudPCGracePeriod {
     
     try {
         $userInfo = if ($UserPrincipalName) { " for user $UserPrincipalName" } else { "" }
-        Write-Log "API Call: Ending grace period$userInfo (Cloud PC: $CloudPCId)" -Level Info
-        Write-ApiLog "[API] POST /cloudPCs/$CloudPCId/endGracePeriod"
+        Write-Log "API Call: Ending grace period$userInfo (Cloud PC: $CloudPCId)" -Level 'Info  '
+        Write-ApiLog "POST /cloudPCs/$CloudPCId/endGracePeriod"
         
         $uri = "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/cloudPCs/$CloudPCId/endGracePeriod"
         Invoke-MgGraphRequest -Uri $uri -Method POST
         
-        Write-Log "Successfully ended grace period$userInfo" -Level Success
+        Write-Log "Successfully ended grace period$userInfo" -Level 'OK    '
         return $true
     }
     catch {
-        Write-Log "Error ending grace period$userInfo : $_" -Level Error
+        Write-Log "Error ending grace period$userInfo : $_" -Level 'FAIL  '
         return $false
     }
 }
@@ -325,31 +357,31 @@ function Wait-CloudPCGracePeriod {
     $startTime = Get-Date
     $timeout = $startTime.AddMinutes($TimeoutMinutes)
     
-    Write-Log "Waiting for Cloud PC to enter grace period for user: $UserId" -Level Info
+    Write-Log "Waiting for Cloud PC to enter grace period for user: $UserId" -Level 'Info  '
     
     while ((Get-Date) -lt $timeout) {
         if ($CancellationToken -and $CancellationToken.Value) {
-            Write-Log "Operation cancelled by user" -Level Warning
+            Write-Log "Operation cancelled by user" -Level 'WARN  '
             return $null
         }
         
         $cloudPC = Get-CloudPCForUser -UserId $UserId
         
         if (-not $cloudPC) {
-            Write-Log "Cloud PC not found for user (may be deprovisioned)" -Level Info
+            Write-Log "Cloud PC not found for user (may be deprovisioned)" -Level 'Info  '
             return $null
         }
         
         if ($cloudPC.status -eq 'inGracePeriod') {
-            Write-Log "Cloud PC entered grace period" -Level Success
+            Write-Log "Cloud PC entered grace period" -Level 'OK    '
             return $cloudPC
         }
         
-        Write-Log "Current status: $($cloudPC.status). Waiting..." -Level Info
+        Write-Log "Current status: $($cloudPC.status). Waiting..." -Level 'Info  '
         Start-Sleep -Seconds $PollingIntervalSeconds
     }
     
-    Write-Log "Timeout waiting for grace period" -Level Error
+    Write-Log "Timeout waiting for grace period" -Level 'FAIL  '
     return $null
 }
 
@@ -376,11 +408,11 @@ function Wait-CloudPCProvisioning {
     $startTime = Get-Date
     $timeout = $startTime.AddMinutes($TimeoutMinutes)
     
-    Write-Log "Waiting for new Cloud PC to provision for user: $UserId" -Level Info
+    Write-Log "Waiting for new Cloud PC to provision for user: $UserId" -Level 'Info  '
     
     while ((Get-Date) -lt $timeout) {
         if ($CancellationToken -and $CancellationToken.Value) {
-            Write-Log "Operation cancelled by user" -Level Warning
+            Write-Log "Operation cancelled by user" -Level 'WARN  '
             return $null
         }
         
@@ -388,25 +420,25 @@ function Wait-CloudPCProvisioning {
         
         if ($cloudPC) {
             if ($cloudPC.status -eq 'provisioned') {
-                Write-Log "Cloud PC successfully provisioned" -Level Success
+                Write-Log "Cloud PC successfully provisioned" -Level 'OK    '
                 return $cloudPC
             }
             elseif ($cloudPC.status -eq 'failed') {
-                Write-Log "Cloud PC provisioning failed" -Level Error
+                Write-Log "Cloud PC provisioning failed" -Level 'FAIL  '
                 return $cloudPC
             }
             else {
-                Write-Log "Current provisioning status: $($cloudPC.status)" -Level Info
+                Write-Log "Current provisioning status: $($cloudPC.status)" -Level 'Info  '
             }
         }
         else {
-            Write-Log "No Cloud PC found yet, waiting for provisioning to start..." -Level Info
+            Write-Log "No Cloud PC found yet, waiting for provisioning to start..." -Level 'Info  '
         }
         
         Start-Sleep -Seconds $PollingIntervalSeconds
     }
     
-    Write-Log "Timeout waiting for provisioning" -Level Error
+    Write-Log "Timeout waiting for provisioning" -Level 'FAIL  '
     return $null
 }
 #endregion
@@ -448,7 +480,7 @@ function Find-EntraIDGroups {
         return ,$allGroups
     }
     catch {
-        Write-Log "Error searching for groups: $_" -Level Error
+        Write-Log "Error searching for groups: $_" -Level 'FAIL  '
         throw
     }
 }
@@ -484,7 +516,7 @@ function Get-GroupMembers {
         return $allMembers
     }
     catch {
-        Write-Log "Error getting group members: $_" -Level Error
+        Write-Log "Error getting group members: $_" -Level 'FAIL  '
         throw
     }
 }
@@ -508,23 +540,23 @@ function Remove-UserFromGroup {
     
     try {
         $upnPrefix = if ($UserPrincipalName) { "${UserPrincipalName}: " } else { "" }
-        Write-Log "${upnPrefix}Removing from group $GroupId" -Level Info
-        Write-ApiLog "[API] ${upnPrefix}DELETE /groups/$GroupId/members/$UserId/`$ref"
+        Write-Log "${upnPrefix}Removing from group $GroupId" -Level 'Info  '
+        Write-ApiLog "${upnPrefix}DELETE /groups/$GroupId/members/$UserId/`$ref"
         
         $uri = "https://graph.microsoft.com/v1.0/groups/$GroupId/members/$UserId/`$ref"
         Invoke-MgGraphRequest -Uri $uri -Method DELETE
         
-        Write-Log "${upnPrefix}Removed from group" -Level Success
+        Write-Log "${upnPrefix}Removed from group" -Level 'OK    '
         return $true
     }
     catch {
         if ($_.Exception.Message -like "*does not exist*") {
             $upnPrefix = if ($UserPrincipalName) { "${UserPrincipalName}: " } else { "" }
-            Write-Log "${upnPrefix}Already not in group" -Level Info
+            Write-Log "${upnPrefix}Already not in group" -Level 'Info  '
             return $true
         }
         $upnPrefix = if ($UserPrincipalName) { "${UserPrincipalName}: " } else { "" }
-        Write-Log "${upnPrefix}Error removing from group: $_" -Level Error
+        Write-Log "${upnPrefix}Error removing from group: $_" -Level 'FAIL  '
         return $false
     }
 }
@@ -548,8 +580,8 @@ function Add-UserToGroup {
     
     try {
         $upnPrefix = if ($UserPrincipalName) { "${UserPrincipalName}: " } else { "" }
-        Write-Log "${upnPrefix}Adding to group $GroupId" -Level Info
-        Write-ApiLog "[API] ${upnPrefix}POST /groups/$GroupId/members/`$ref"
+        Write-Log "${upnPrefix}Adding to group $GroupId" -Level 'Info  '
+        Write-ApiLog "${upnPrefix}POST /groups/$GroupId/members/`$ref"
         
         $body = @{
             "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$UserId"
@@ -558,17 +590,17 @@ function Add-UserToGroup {
         $uri = "https://graph.microsoft.com/v1.0/groups/$GroupId/members/`$ref"
         Invoke-MgGraphRequest -Uri $uri -Method POST -Body $body -ContentType "application/json"
         
-        Write-Log "${upnPrefix}Added to group" -Level Success
+        Write-Log "${upnPrefix}Added to group" -Level 'OK    '
         return $true
     }
     catch {
         if ($_.Exception.Message -like "*already exist*") {
             $upnPrefix = if ($UserPrincipalName) { "${UserPrincipalName}: " } else { "" }
-            Write-Log "${upnPrefix}Already in group" -Level Info
+            Write-Log "${upnPrefix}Already in group" -Level 'Info  '
             return $true
         }
         $upnPrefix = if ($UserPrincipalName) { "${UserPrincipalName}: " } else { "" }
-        Write-Log "${upnPrefix}Error adding to group: $_" -Level Error
+        Write-Log "${upnPrefix}Error adding to group: $_" -Level 'FAIL  '
         return $false
     }
 }
@@ -662,7 +694,7 @@ function Start-CloudPCReplace {
         $cloudPC = Get-CloudPCForUser -UserId $UserPrincipalName
         if ($cloudPC) {
             $status.CloudPCId = $cloudPC.id
-            Write-Log "Found existing Cloud PC: $($cloudPC.id) - Status: $($cloudPC.status)" -Level Info
+            Write-Log "Found existing Cloud PC: $($cloudPC.id) - Status: $($cloudPC.status)" -Level 'Info  '
         }
         
         # Step 1: Remove from source group
@@ -702,7 +734,7 @@ function Start-CloudPCReplace {
                 
                 $ended = Stop-CloudPCGracePeriod -CloudPCId $cloudPC.id
                 if (-not $ended) {
-                    Write-Log "Failed to end grace period, continuing anyway..." -Level Warning
+                    Write-Log "Failed to end grace period, continuing anyway..." -Level 'WARN  '
                 }
             }
         }
@@ -739,14 +771,14 @@ function Start-CloudPCReplace {
             $status.Status = 'Success'
             $status.CloudPCId = $newCloudPC.id
             $status.ProgressPercent = 100
-            Write-Log "Replace completed successfully for $UserPrincipalName" -Level Success
+            Write-Log "Replace completed successfully for $UserPrincipalName" -Level 'OK    '
         }
         else {
             $status.Stage = 'Failed'
             $status.Status = 'Failed'
             $status.ProgressPercent = 70
             $status.ErrorMessage = "New Cloud PC did not provision successfully"
-            Write-Log $status.ErrorMessage -Level Error
+            Write-Log $status.ErrorMessage -Level 'FAIL  '
         }
     }
     catch {
@@ -754,7 +786,7 @@ function Start-CloudPCReplace {
         $status.Status = 'Failed'
         $status.ProgressPercent = 0
         $status.ErrorMessage = $_.Exception.Message
-        Write-Log "Replace failed for $UserPrincipalName : $($status.ErrorMessage)" -Level Error
+        Write-Log "Replace failed for $UserPrincipalName : $($status.ErrorMessage)" -Level 'FAIL  '
     }
     
     $status.LastUpdate = Get-Date
@@ -775,8 +807,8 @@ function Write-Log {
         [string]$Message,
         
         [Parameter(Mandatory = $false)]
-        [ValidateSet('Info', 'Success', 'Warning', 'Error')]
-        [string]$Level = 'Info'
+        [ValidateSet('Info  ', 'OK    ', 'WARN  ', 'FAIL  ')]
+        [string]$Level = 'Info  '
     )
     
     $timestamp = Get-Date -Format "HH:mm:ss"
@@ -784,9 +816,9 @@ function Write-Log {
     
     # Console output with colors
     switch ($Level) {
-        'Success' { Write-Host $logMessage -ForegroundColor Green }
-        'Warning' { Write-Host $logMessage -ForegroundColor Yellow }
-        'Error' { Write-Host $logMessage -ForegroundColor Red }
+        'OK    ' { Write-Host $logMessage -ForegroundColor Green }
+        'WARN  ' { Write-Host $logMessage -ForegroundColor Yellow }
+        'FAIL  ' { Write-Host $logMessage -ForegroundColor Red }
         default { Write-Host $logMessage }
     }
     
@@ -814,12 +846,565 @@ function Initialize-Logging {
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $script:LogFilePath = Join-Path $LogPath "Replace_$timestamp.log"
     
-    Write-Log "=== Cloud PC replace Session Started ===" -Level Info
+    Write-Log "=== Cloud PC replace Session Started ===" -Level 'Info  '
     return $script:LogFilePath
 }
 #endregion
 
 #region Helper Functions
+function Get-StageDisplay {
+    <#
+    .SYNOPSIS
+        Formats stage name with step number for display
+    .PARAMETER Stage
+        The stage name to format
+    .EXAMPLE
+        Get-StageDisplay -Stage "Waiting for Grace Period"
+        Returns: "5/9 - Waiting for Grace Period"
+    #>
+    [CmdletBinding()]
+    param([string]$Stage)
+    
+    $stageMap = @{
+        'Queued' = '1/9'
+        'Getting User Info' = '2/9'
+        'Getting Current Cloud PC' = '3/9'
+        'Removing from Source' = '4/9'
+        'Waiting for Grace Period' = '5/9'
+        'Ending Grace Period' = '6/9'
+        'Waiting for Deprovision' = '7/9'
+        'Adding to Target' = '8/9'
+        'Waiting for Provisioning' = '9/9'
+        'Complete' = 'Done'
+    }
+    
+    $prefix = $stageMap[$Stage]
+    if ($prefix) {
+        return $prefix + ' - ' + $Stage
+    }
+    return $Stage
+}
+
+function Invoke-CloudPCReplaceStep {
+    <#
+    .SYNOPSIS
+        Processes one step of the Cloud PC replacement state machine
+    .DESCRIPTION
+        Examines the current state and performs the next action in the replacement process.
+        This function is called repeatedly by the UI on a timer to advance through stages.
+        It performs ONE action per call and updates the state accordingly.
+    .PARAMETER State
+        The UserReplaceState object containing the current job state
+    .PARAMETER Timeouts
+        Hashtable containing timeout values in minutes:
+        - GracePeriodTimeout
+        - EndingGracePeriodTimeout
+        - DeprovisionTimeout
+        - ProvisioningTimeout
+    .PARAMETER OnLog
+        Scriptblock called for logging: { param($Message, $Level, $Color) }
+        Levels: "Status", "Info", "Debug", "Polling", "Verbose"
+    .PARAMETER OnGridUpdate
+        Optional scriptblock called for grid updates: { param($State, $ColumnName, $Value) }
+    .EXAMPLE
+        Invoke-CloudPCReplaceStep -State $jobState -Timeouts $timeouts `
+            -OnLog { param($msg,$lvl,$clr) Write-Host $msg -ForegroundColor $clr }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [UserReplaceState]$State,
+        
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Timeouts,
+        
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$OnLog,
+        
+        [Parameter(Mandatory = $false)]
+        [scriptblock]$OnGridUpdate
+    )
+    
+    # Helper function to log messages
+    function Write-StepLog {
+        param([string]$Message, [string]$Level = "Info", [string]$Color = "White")
+        & $OnLog $Message $Level $Color
+    }
+    
+    try {
+        switch ($State.Stage) {
+            "Getting User Info" {
+                Write-StepLog "[Action] $($State.UserPrincipalName): Getting user info..." "Status" "Cyan"
+                
+                $uri = "https://graph.microsoft.com/v1.0/users?`$filter=userPrincipalName eq '$($State.UserPrincipalName)'&`$select=id,userPrincipalName,displayName"
+                $userResponse = Invoke-MgGraphRequest -Uri $uri -Method GET
+                $user = $userResponse.value | Select-Object -First 1
+                
+                if (-not $user) { throw "User not found" }
+                $State.UserId = $user.id
+                Write-StepLog "[Action] $($State.UserPrincipalName): User found (ID: $($State.UserId))" "Status" "Green"
+                
+                $State.Stage = "Getting Current Cloud PC"
+                $State.ProgressPercent = 10
+            }
+            
+            "Getting Current Cloud PC" {
+                Write-StepLog "[Action] $($State.UserPrincipalName): Checking for existing Cloud PC..." "Status" "Cyan"
+                
+                if (-not $State.SourcePolicyIds) {
+                    Write-StepLog "[Debug ] Getting provisioning policies for source group: $($State.SourceGroupName)" "Debug" "Gray"
+                    $State.SourcePolicyIds = @(Get-ProvisioningPoliciesForGroup -GroupId $State.SourceGroupId)
+                    if ($State.SourcePolicyIds.Count -gt 0) {
+                        Write-StepLog "[Debug ] Source group uses $($State.SourcePolicyIds.Count) provisioning policy(ies)" "Debug" "Gray"
+                    }
+                }
+                
+                $cloudPCs = Get-CloudPCForUser -UserId $State.UserPrincipalName
+                $cloudPCsArray = @($cloudPCs)
+                
+                if ($cloudPCsArray.Count -gt 0) {
+                    Write-StepLog "[Debug ] $($State.UserPrincipalName): Found $($cloudPCsArray.Count) Cloud PC(s) for user" "Debug" "Yellow"
+                    
+                    foreach ($cpc in $cloudPCsArray) {
+                        $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                        Write-StepLog "[Debug ]   $($State.UserPrincipalName): CPC: $cpcName | Status: $($cpc.status) | ID: $($cpc.id)" "Debug" "Yellow"
+                        Write-StepLog "[Debug ]     $($State.UserPrincipalName): Policy: $($cpc.provisioningPolicyId)" "Debug" "Yellow"
+                    }
+                    
+                    $matchingCPCs = @()
+                    if ($State.SourcePolicyIds -and $State.SourcePolicyIds.Count -gt 0) {
+                        Write-StepLog "[Debug ] $($State.UserPrincipalName): Looking for CPCs matching source policy..." "Debug" "Cyan"
+                        $matchingCPCs = @($cloudPCsArray | Where-Object { $State.SourcePolicyIds -contains $_.provisioningPolicyId })
+                    }
+                    
+                    if ($matchingCPCs.Count -gt 0) {
+                        $State.OldCPCs = @($matchingCPCs | ForEach-Object {
+                            @{
+                                Id = $_.id
+                                Name = if ($_.managedDeviceName) { $_.managedDeviceName } else { $_.displayName }
+                                ServicePlan = $_.servicePlanName
+                            }
+                        })
+                        
+                        $State.CloudPCIds = @($matchingCPCs | ForEach-Object { $_.id })
+                        
+                        Write-StepLog "[Debug ] Captured $($State.CloudPCIds.Count) old CPC ID(s) for tracking: $($State.CloudPCIds -join ', ')" "Debug" "Magenta"
+                        
+                        $oldCPCNames = $matchingCPCs | ForEach-Object {
+                            if ($_.managedDeviceName) { $_.managedDeviceName } else { $_.displayName }
+                        }
+                        $State.OldCPCName = $oldCPCNames -join ", "
+                        
+                        Write-StepLog "[Action] $($State.UserPrincipalName): Found $($matchingCPCs.Count) CPC(s) from SOURCE policy" "Status" "Green"
+                        foreach ($cpc in $matchingCPCs) {
+                            $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                            Write-StepLog "[Action]   OLD: $cpcName | ID: $($cpc.id) | Plan: $($cpc.servicePlanName)" "Status" "Cyan"
+                        }
+                        
+                        if ($matchingCPCs.Count -gt 1) {
+                            Write-StepLog "[Info  ] $($State.UserPrincipalName): User has MULTIPLE CPCs from same policy (likely multiple licenses)" "Status" "Cyan"
+                            Write-StepLog "[Info  ] $($State.UserPrincipalName): All will be deprovisioned before provisioning new CPC(s)" "Info" "Cyan"
+                        }
+                    }
+                    else {
+                        Write-StepLog "[WARN  ] $($State.UserPrincipalName): Has $($cloudPCs.Count) CPC(s) but NONE match source policy!" "Status" "Yellow"
+                        Write-StepLog "[Info  ] Source policy IDs: $($State.SourcePolicyIds -join ', ')" "Info" "Yellow"
+                        $State.OldCPCs = @()
+                        $State.CloudPCIds = @()
+                    }
+                }
+                else {
+                    Write-StepLog "[Action] $($State.UserPrincipalName): No existing Cloud PC found" "Status" "Yellow"
+                    $State.OldCPCs = @()
+                    $State.CloudPCIds = @()
+                }
+                
+                Write-StepLog "[Debug ] Current group memberships:" "Debug" "Magenta"
+                $currentGroups = Get-UserGroupMemberships -UserId $State.UserId
+                foreach ($grp in $currentGroups) {
+                    Write-StepLog "[Debug ]   - Member of: $($grp.displayName) (ID: $($grp.id))" "Debug" "Magenta"
+                }
+                
+                $State.Stage = "Removing from Source"
+                $State.ProgressPercent = 20
+                $State.StageStartTime = Get-Date
+            }
+            
+            "Removing from Source" {
+                if (-not $State.CloudPCIds -or $State.CloudPCIds.Count -eq 0) {
+                    Write-StepLog "[FAIL  ] $($State.UserPrincipalName): User has NO Cloud PC matching source policy!" "Status" "Red"
+                    Write-StepLog "[FAIL  ] Cannot replace - admin must investigate manually" "Status" "Red"
+                    Write-StepLog "[FAIL  ] User remains in source group (no changes made)" "Status" "Red"
+                    throw "No Cloud PC found matching source provisioning policy. User needs manual intervention."
+                }
+                
+                Write-StepLog "[Action] $($State.UserPrincipalName): Removing from source group ($($State.SourceGroupName))..." "Status" "Cyan"
+                Remove-UserFromGroup -UserId $State.UserId -GroupId $State.SourceGroupId -UserPrincipalName $State.UserPrincipalName | Out-Null
+                Write-StepLog "[Action] $($State.UserPrincipalName): Removed from source group" "Status" "Green"
+                Write-StepLog "[Info  ] $($State.UserPrincipalName): Tracking $($State.CloudPCIds.Count) CPC(s) - waiting for grace period..." "Info" "Cyan"
+                
+                $State.Stage = "Waiting for Grace Period"
+                $State.ProgressPercent = 30
+                $State.StageStartTime = Get-Date
+            }
+            
+            "Waiting for Grace Period" {
+                if (-not $State.CloudPCIds -or $State.CloudPCIds.Count -eq 0) {
+                    Write-StepLog "[FAIL  ] No CPC IDs to track - should not be in grace period stage!" "Status" "Red"
+                    throw "Logic error: No CPC IDs set"
+                }
+                
+                $cloudPCs = Get-CloudPCForUser -UserId $State.UserPrincipalName
+                $trackedCPCs = @($cloudPCs | Where-Object { $State.CloudPCIds -contains $_.id })
+                
+                if ($trackedCPCs.Count -eq 0) {
+                    Write-StepLog "[Detect] $($State.UserPrincipalName): All tracked CPCs disappeared (already deprovisioned)" "Status" "Green"
+                    # Log the old CPC details before clearing
+                    foreach ($oldCPC in $State.OldCPCs) {
+                        Write-StepLog "[Detect]   OLD: $($oldCPC.Name) | ID: $($oldCPC.Id) - deprovisioned" "Status" "Gray"
+                    }
+                    # Clear CloudPCIds so any CPC found later is considered "new"
+                    # NOTE: Azure appears to reuse the same cloudPcId GUID when deprovisioning/reprovisioning
+                    # for the same user. The device name changes but the Cloud PC object ID may persist.
+                    # Clearing this array ensures we detect the reprovisioned CPC as "new".
+                    Write-StepLog "[Debug ] [Grace] Clearing old CPC ID tracking array (was: $($State.CloudPCIds -join ', '))" "Debug" "Magenta"
+                    $State.CloudPCIds = @()
+                    Write-StepLog "[Debug ] After clear, CloudPCIds.Count = $($State.CloudPCIds.Count)" "Debug" "Magenta"
+                    $State.Stage = "Adding to Target"
+                    $State.ProgressPercent = 60
+                    $State.StageStartTime = Get-Date
+                }
+                else {
+                    $anyDeprovisioning = $trackedCPCs | Where-Object { $_.status -in @('deprovisioning', 'notProvisioned') }
+                    
+                    if ($anyDeprovisioning) {
+                        Write-StepLog "[Detect] $($State.UserPrincipalName): CPCs already deprovisioning - skipping grace period stages!" "Status" "Yellow"
+                        foreach ($cpc in $anyDeprovisioning) {
+                            $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                            Write-StepLog "[Detect]   - $cpcName (status: $($cpc.status))" "Status" "Yellow"
+                        }
+                        # Log the old CPC details if we're skipping ahead
+                        foreach ($oldCPC in $State.OldCPCs) {
+                            Write-StepLog "[Info  ]   OLD: $($oldCPC.Name) | ID: $($oldCPC.Id)" "Info" "Gray"
+                        }
+                        $State.Stage = "Waiting for Deprovision"
+                        $State.ProgressPercent = 55
+                        $State.StageStartTime = Get-Date
+                    }
+                    else {
+                        $allInGrace = $true
+                        $statusSummary = @{}
+                        
+                        foreach ($cpc in $trackedCPCs) {
+                            $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                            
+                            if ($cpc.status -ne 'inGracePeriod') {
+                                $allInGrace = $false
+                            }
+                            
+                            if (-not $statusSummary.ContainsKey($cpc.status)) {
+                                $statusSummary[$cpc.status] = @()
+                            }
+                            $statusSummary[$cpc.status] += $cpcName
+                        }
+                        
+                        if ($allInGrace) {
+                            Write-StepLog "[Detect] $($State.UserPrincipalName): ALL $($trackedCPCs.Count) tracked CPCs entered grace period!" "Status" "Green"
+                            foreach ($cpc in $trackedCPCs) {
+                                $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                                Write-StepLog "[Detect]   - $cpcName (status: $($cpc.status))" "Status" "Green"
+                            }
+                            
+                            $State.Stage = "Ending Grace Period"
+                            $State.ProgressPercent = 40
+                            $State.StageStartTime = Get-Date
+                        }
+                        else {
+                            Write-StepLog "[Poll  ] $($State.UserPrincipalName): Waiting for all CPCs to enter grace..." "Polling" "Gray"
+                            foreach ($status in $statusSummary.Keys) {
+                                $names = $statusSummary[$status] -join ', '
+                                Write-StepLog "[Debug ]   Status '$status': $names" "Debug" "Gray"
+                            }
+                            
+                            $elapsed = (Get-Date) - $State.StageStartTime
+                            if ($elapsed.TotalMinutes -gt $Timeouts.GracePeriodTimeout) {
+                                throw "Timeout waiting for grace period"
+                            }
+                        }
+                    }
+                }
+            }
+            
+            "Ending Grace Period" {
+                if (-not $State.GraceEndedCPCIds -or $State.GraceEndedCPCIds.Count -eq 0) {
+                    Write-StepLog "[Action] $($State.UserPrincipalName): Ending grace period on $($State.CloudPCIds.Count) tracked CPC(s)..." "Status" "Cyan"
+                    
+                    $State.GraceEndedCPCIds = @()
+                    
+                    foreach ($cpcId in $State.CloudPCIds) {
+                        Write-StepLog "[Debug ] Ending grace for CPC ID: $cpcId" "Debug" "Gray"
+                        Stop-CloudPCGracePeriod -CloudPCId $cpcId -UserPrincipalName $State.UserPrincipalName | Out-Null
+                        $State.GraceEndedCPCIds += $cpcId
+                    }
+                    
+                    Write-StepLog "[Action] $($State.UserPrincipalName): End grace API called - waiting for deprovisioning to start..." "Status" "Green"
+                }
+                
+                $cloudPCs = Get-CloudPCForUser -UserId $State.UserPrincipalName
+                $trackedCPCs = @($cloudPCs | Where-Object { $State.CloudPCIds -contains $_.id })
+                
+                if ($trackedCPCs.Count -eq 0) {
+                    Write-StepLog "[Detect] $($State.UserPrincipalName): All tracked CPCs disappeared (already deprovisioned)" "Status" "Green"
+                    # Log the old CPC details before clearing
+                    foreach ($oldCPC in $State.OldCPCs) {
+                        Write-StepLog "[Detect]   OLD: $($oldCPC.Name) | ID: $($oldCPC.Id) - deprovisioned" "Status" "Gray"
+                    }
+                    # Clear CloudPCIds so any CPC found later is considered "new"
+                    # NOTE: Azure appears to reuse the same cloudPcId GUID when deprovisioning/reprovisioning
+                    # for the same user. The device name changes but the Cloud PC object ID may persist.
+                    # Clearing this array ensures we detect the reprovisioned CPC as "new".
+                    Write-StepLog "[Debug ] [EndGrace] Clearing old CPC ID tracking array (was: $($State.CloudPCIds -join ', '))" "Debug" "Magenta"
+                    $State.CloudPCIds = @()
+                    Write-StepLog "[Debug ] After clear, CloudPCIds.Count = $($State.CloudPCIds.Count)" "Debug" "Magenta"
+                    $State.Stage = "Adding to Target"
+                    $State.ProgressPercent = 60
+                    $State.StageStartTime = Get-Date
+                }
+                else {
+                    $anyDeprovisioning = $trackedCPCs | Where-Object { $_.status -in @('deprovisioning', 'notProvisioned') }
+                    
+                    if ($anyDeprovisioning) {
+                        Write-StepLog "[Detect] $($State.UserPrincipalName): Deprovisioning confirmed - backend processing started!" "Status" "Green"
+                        foreach ($cpc in $anyDeprovisioning) {
+                            $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                            Write-StepLog "[Detect]   - $cpcName (status: $($cpc.status))" "Status" "Green"
+                        }
+                        
+                        $State.Stage = "Waiting for Deprovision"
+                        $State.ProgressPercent = 55
+                        $State.StageStartTime = Get-Date
+                        $State.LastPollTime = Get-Date
+                    }
+                    else {
+                        $elapsed = (Get-Date) - $State.StageStartTime
+                        Write-StepLog "[Poll  ] $($State.UserPrincipalName): Waiting for deprovisioning to start (elapsed: $([math]::Round($elapsed.TotalMinutes, 1))min)..." "Polling" "Gray"
+                        
+                        foreach ($cpc in $trackedCPCs) {
+                            $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                            Write-StepLog "[Debug ]   - $cpcName (status: $($cpc.status))" "Debug" "Gray"
+                        }
+                        
+                        if ($elapsed.TotalMinutes -gt $Timeouts.EndingGracePeriodTimeout) {
+                            throw "Timeout waiting for deprovisioning to start after ending grace period"
+                        }
+                    }
+                }
+            }
+            
+            "Waiting for Deprovision" {
+                $cloudPCs = Get-CloudPCForUser -UserId $State.UserPrincipalName
+                $trackedCPCs = @($cloudPCs | Where-Object { $State.CloudPCIds -contains $_.id })
+                
+                $activeCPCs = @()
+                foreach ($cpc in $trackedCPCs) {
+                    if ($cpc.status -eq 'notProvisioned') {
+                        continue
+                    }
+                    
+                    if ($cpc.status -eq 'deprovisioning' -and -not $State.DeprovisioningSeenCPCs.ContainsKey($cpc.id)) {
+                        $State.DeprovisioningSeenCPCs[$cpc.id] = $true
+                        Write-StepLog "[Detect] CPC $($cpc.id) reached 'deprovisioning' status - backend is processing" "Status" "Green"
+                    }
+                    
+                    if ($cpc.status -eq 'inGracePeriod' -and $State.GraceEndedCPCIds -contains $cpc.id) {
+                        $timeSinceGraceEnded = ((Get-Date) - $State.StageStartTime).TotalMinutes
+                        
+                        $statusInfo = ""
+                        if ($cpc.statusDetails) {
+                            $statusInfo = " | statusDetails: $($cpc.statusDetails.code) - $($cpc.statusDetails.message)"
+                        }
+                        if ($cpc.lastModifiedDateTime) {
+                            $lastModified = [DateTime]::SpecifyKind([DateTime]::Parse($cpc.lastModifiedDateTime), [DateTimeKind]::Utc)
+                            $minutesSinceModified = ((Get-Date).ToUniversalTime() - $lastModified).TotalMinutes
+                            $statusInfo += " | Last modified: $([math]::Round($minutesSinceModified, 1))min ago"
+                        }
+                        
+                        if ($State.DeprovisioningSeenCPCs.ContainsKey($cpc.id)) {
+                            Write-StepLog "[Debug ] CPC $($cpc.id) flip-flopped back to inGracePeriod (seen deprovisioning before) - API inconsistency$statusInfo" "Debug" "Yellow"
+                            if ($OnGridUpdate) {
+                                & $OnGridUpdate $State "Messages" "Status flip-flop detected (API lag)"
+                            }
+                            $activeCPCs += $cpc
+                        }
+                        else {
+                            Write-StepLog "[Debug ] CPC $($cpc.id) still shows inGracePeriod $([math]::Round($timeSinceGraceEnded, 1))min after ending grace - waiting for backend$statusInfo" "Debug" "Gray"
+                            $activeCPCs += $cpc
+                        }
+                    }
+                    elseif ($cpc.status -eq 'deprovisioning') {
+                        $activeCPCs += $cpc
+                    }
+                    else {
+                        Write-StepLog "[WARN  ] CPC $($cpc.id) in unexpected status: $($cpc.status)" "Status" "Yellow"
+                        $activeCPCs += $cpc
+                    }
+                }
+                
+                if ($activeCPCs.Count -eq 0) {
+                    Write-StepLog "[Detect] $($State.UserPrincipalName): All tracked CPCs deprovisioned!" "Status" "Green"
+                    # Log the old CPC details before clearing
+                    foreach ($oldCPC in $State.OldCPCs) {
+                        Write-StepLog "[Detect]   OLD: $($oldCPC.Name) | ID: $($oldCPC.Id) - deprovisioned" "Status" "Gray"
+                    }
+                    # Clear CloudPCIds so any CPC found later is considered "new"
+                    # NOTE: Azure appears to reuse the same cloudPcId GUID when deprovisioning/reprovisioning
+                    # for the same user. The device name changes but the Cloud PC object ID may persist.
+                    # Clearing this array ensures we detect the reprovisioned CPC as "new".
+                    Write-StepLog "[Debug ] Clearing old CPC ID tracking array (was: $($State.CloudPCIds -join ', '))" "Debug" "Magenta"
+                    $State.CloudPCIds = @()
+                    Write-StepLog "[Debug ] After clear, CloudPCIds.Count = $($State.CloudPCIds.Count)" "Debug" "Magenta"
+                    $State.Stage = "Adding to Target"
+                    $State.ProgressPercent = 60
+                    $State.StageStartTime = Get-Date
+                }
+                else {
+                    $elapsed = (Get-Date) - $State.StageStartTime
+                    Write-StepLog "[Poll  ] $($State.UserPrincipalName): Waiting for $($activeCPCs.Count) CPC(s) to deprovision (elapsed: $([math]::Round($elapsed.TotalMinutes, 1))min)..." "Polling" "Gray"
+                    
+                    foreach ($cpc in $activeCPCs) {
+                        $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                        Write-StepLog "[Debug ]   - $cpcName (status: $($cpc.status))" "Debug" "Gray"
+                    }
+                    
+                    if ($elapsed.TotalMinutes -gt $Timeouts.DeprovisionTimeout) {
+                        throw "Timeout waiting for Cloud PCs to deprovision"
+                    }
+                }
+            }
+            
+            "Adding to Target" {
+                Write-StepLog "[Action] $($State.UserPrincipalName): Adding to target group ($($State.TargetGroupName))..." "Status" "Cyan"
+                Add-UserToGroup -UserId $State.UserId -GroupId $State.TargetGroupId -UserPrincipalName $State.UserPrincipalName | Out-Null
+                Write-StepLog "[Action] $($State.UserPrincipalName): Added to target group" "Status" "Green"
+                Write-StepLog "[Info  ] $($State.UserPrincipalName): Waiting for new Cloud PC to provision..." "Info" "Cyan"
+                
+                $State.Stage = "Waiting for Provisioning"
+                $State.ProgressPercent = 70
+                $State.StageStartTime = Get-Date
+                $State.LastPollTime = Get-Date
+            }
+            
+            "Waiting for Provisioning" {
+                $cloudPCs = Get-CloudPCForUser -UserId $State.UserPrincipalName
+                $cloudPCsArray = @($cloudPCs)
+                
+                # Log what we're tracking - show DETAILED old CPC info
+                Write-StepLog "[Debug ] Tracked old CPC IDs ($($State.CloudPCIds.Count)): $($State.CloudPCIds -join ', ')" "Debug" "Cyan"
+                if ($State.OldCPCs -and $State.OldCPCs.Count -gt 0) {
+                    Write-StepLog "[Debug ] Old CPC details from initial capture:" "Debug" "Cyan"
+                    foreach ($oldCPC in $State.OldCPCs) {
+                        Write-StepLog "[Debug ]   - Name: $($oldCPC.Name), ID: $($oldCPC.Id)" "Debug" "Cyan"
+                    }
+                }
+                
+                if ($cloudPCsArray.Count -gt 0) {
+                    # Log all CPCs found for this user with FULL details
+                    Write-StepLog "[Debug ] Found $($cloudPCsArray.Count) total CPC(s) from API:" "Debug" "Cyan"
+                    foreach ($cpc in $cloudPCsArray) {
+                        $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                        $isOld = if ($State.CloudPCIds -contains $cpc.id) { "OLD" } else { "NEW" }
+                        Write-StepLog "[Debug ]   [$isOld] Name: $cpcName | ID: $($cpc.id) | Status: $($cpc.status)" "Debug" "Cyan"
+                        Write-StepLog "[Debug ]        managedDeviceName: '$($cpc.managedDeviceName)' | displayName: '$($cpc.displayName)'" "Debug" "Gray"
+                    }
+                    
+                    $newCPCs = @()
+                    foreach ($cpc in $cloudPCsArray) {
+                        if ($State.CloudPCIds -notcontains $cpc.id) {
+                            $newCPCs += $cpc
+                        }
+                    }
+                    
+                    Write-StepLog "[Debug ] Identified $($newCPCs.Count) NEW CPC(s) (not in old ID list)" "Debug" "Yellow"
+                    
+                    if ($newCPCs.Count -gt 0) {
+                        $provisionedCPCs = @($newCPCs | Where-Object { $_.status -eq 'provisioned' })
+                        
+                        if ($provisionedCPCs.Count -gt 0) {
+                            $State.NewCPCs = @($provisionedCPCs | ForEach-Object {
+                                @{
+                                    Id = $_.id
+                                    Name = if ($_.managedDeviceName) { $_.managedDeviceName } else { $_.displayName }
+                                    ServicePlan = $_.servicePlanName
+                                }
+                            })
+                            
+                            $newCPCNames = $provisionedCPCs | ForEach-Object {
+                                if ($_.managedDeviceName) { $_.managedDeviceName } else { $_.displayName }
+                            }
+                            $State.NewCPCName = $newCPCNames -join ", "
+                            
+                            Write-StepLog "[Detect] $($State.UserPrincipalName): New Cloud PC(s) provisioned successfully!" "Status" "Green"
+                            foreach ($cpc in $provisionedCPCs) {
+                                $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                                Write-StepLog "[Detect]   NEW: $cpcName | ID: $($cpc.id) | Plan: $($cpc.servicePlanName)" "Status" "Green"
+                            }
+                            
+                            $State.Stage = "Complete"
+                            $State.ProgressPercent = 100
+                            $State.Status = "Success"
+                            $State.EndTime = Get-Date
+                            $State.FinalMessage = "Successfully replaced Cloud PC(s)"
+                        }
+                        else {
+                            $elapsed = (Get-Date) - $State.StageStartTime
+                            Write-StepLog "[Poll  ] $($State.UserPrincipalName): New CPC(s) found but not provisioned yet (elapsed: $([math]::Round($elapsed.TotalMinutes, 1))min)..." "Polling" "Gray"
+                            
+                            foreach ($cpc in $newCPCs) {
+                                $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
+                                Write-StepLog "[Debug ]   - $cpcName (status: $($cpc.status))" "Debug" "Gray"
+                                
+                                if ($cpc.status -eq 'failed') {
+                                    throw "New Cloud PC provisioning failed: $($cpc.statusDetails.message)"
+                                }
+                            }
+                            
+                            if ($elapsed.TotalMinutes -gt $Timeouts.ProvisioningTimeout) {
+                                throw "Timeout waiting for new Cloud PC(s) to provision"
+                            }
+                        }
+                    }
+                    else {
+                        $elapsed = (Get-Date) - $State.StageStartTime
+                        Write-StepLog "[Poll  ] $($State.UserPrincipalName): No new Cloud PC found yet (elapsed: $([math]::Round($elapsed.TotalMinutes, 1))min)..." "Polling" "Gray"
+                        
+                        if ($elapsed.TotalMinutes -gt $Timeouts.ProvisioningTimeout) {
+                            throw "Timeout waiting for new Cloud PC(s) to appear"
+                        }
+                    }
+                }
+                else {
+                    $elapsed = (Get-Date) - $State.StageStartTime
+                    Write-StepLog "[Poll  ] $($State.UserPrincipalName): No Cloud PCs found yet (elapsed: $([math]::Round($elapsed.TotalMinutes, 1))min)..." "Polling" "Gray"
+                    
+                    if ($elapsed.TotalMinutes -gt $Timeouts.ProvisioningTimeout) {
+                        throw "Timeout waiting for new Cloud PC(s) to provision"
+                    }
+                }
+            }
+            
+            default {
+                Write-StepLog "[WARN  ] Unknown stage: $($State.Stage)" "Status" "Yellow"
+            }
+        }
+    }
+    catch {
+        $State.Status = "Failed"
+        $State.ErrorMessage = $_.Exception.Message
+        $State.EndTime = Get-Date
+        Write-StepLog "[FAIL  ] $($State.UserPrincipalName): $($_.Exception.Message)" "Status" "Red"
+    }
+}
+
 function Test-GraphConnection {
     <#
     .SYNOPSIS
@@ -852,5 +1437,11 @@ Export-ModuleMember -Function @(
     'Get-GroupMembers',
     'Initialize-Logging',
     'Write-Log',
-    'Test-GraphConnection'
+    'Test-GraphConnection',
+    'Get-StageDisplay',
+    'Invoke-CloudPCReplaceStep'
 )
+
+
+
+
