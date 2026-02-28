@@ -32,3 +32,9 @@ $RECYCLE.BIN/
 
 # Development test files
 Test-Refactoring.ps1
+
+# Legacy WinForms script (kept locally for reference only)
+Start-CloudPCReplaceWinForms.ps1
+
+# Local reference/scratch directories
+Samples/

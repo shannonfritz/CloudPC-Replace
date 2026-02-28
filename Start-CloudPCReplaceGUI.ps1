@@ -1179,7 +1179,7 @@ $chkVerbose.Add_Unchecked({ $script:verboseLogging = $false; Write-Log "[Info  ]
 # Concurrent spinner
 function Set-ConcurrentValue { param([int]$Delta)
     $cur = 2; try { $cur = [int]$script:txtConcurrent.Text } catch {}
-    $cur = [math]::Max(1, [math]::Min(10, $cur + $Delta))
+    $cur = [math]::Max(1, [math]::Min(40, $cur + $Delta))
     $script:txtConcurrent.Text = "$cur"
     $script:maxConcurrent = $cur
     Write-Log "[Info  ] Concurrent limit set to $cur"
@@ -1189,7 +1189,7 @@ $btnConcurrentDown.Add_Click({ Set-ConcurrentValue -1 })
 $script:txtConcurrent.Add_LostFocus({
     $val = 2
     if ([int]::TryParse($script:txtConcurrent.Text, [ref]$val)) {
-        $val = [math]::Max(1, [math]::Min(10, $val))
+        $val = [math]::Max(1, [math]::Min(40, $val))
         $script:txtConcurrent.Text = "$val"
         $script:maxConcurrent = $val
     } else {

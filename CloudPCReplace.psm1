@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 
 <#
 .SYNOPSIS
@@ -246,6 +246,21 @@ function Get-UserGroupMemberships {
         return @()
     }
 }
+
+function Get-UserInfo {
+    <#
+    .SYNOPSIS
+        Gets a user's basic info (id, userPrincipalName, displayName) by UPN
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$UserPrincipalName
+    )
+    $uri = "https://graph.microsoft.com/v1.0/users?`$filter=userPrincipalName eq '$UserPrincipalName'&`$select=id,userPrincipalName,displayName"
+    $response = Invoke-MgGraphRequest -Uri $uri -Method GET
+    return $response.value | Select-Object -First 1
+}
 
 function Get-ProvisioningPoliciesForGroup {
     <#
@@ -300,6 +315,67 @@ function Get-ProvisioningPoliciesForGroup {
         Write-Host "[$timestamp] [ERROR] Error getting provisioning policies: $_" -ForegroundColor Red
         Write-Log "Error getting provisioning policies for group $GroupId : $_" -Level 'FAIL  '
         return @()
+    }
+}
+
+function Get-EnterprisePolicyGroups {
+    <#
+    .SYNOPSIS
+        Gets all Entra ID groups assigned to Enterprise Cloud PC provisioning policies
+    #>
+    try {
+        Write-Log "API Call: Fetching Enterprise provisioning policies with assignments" -Level 'Info  '
+        $uri      = "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies?`$expand=assignments"
+        $response = Invoke-MgGraphRequest -Uri $uri -Method GET
+
+        $groupIds    = [System.Collections.Generic.HashSet[string]]::new()
+        $groupPolicyMap = @{}   # groupId → policy displayName(s)
+        $policyCount = 0
+        foreach ($policy in @($response.value)) {
+            # Skip Frontline Worker policies (cloudPcType = 'frontline')
+            if ($policy.cloudPcType -eq 'frontline') {
+                Write-DebugLog "[DEBUG] Skipping Frontline policy: $($policy.displayName)" "DarkGray"
+                continue
+            }
+            $policyCount++
+            foreach ($assignment in @($policy.assignments)) {
+                $gid = $assignment.target.groupId
+                if ($gid) {
+                    $groupIds.Add($gid) | Out-Null
+                    if (-not $groupPolicyMap.ContainsKey($gid)) { $groupPolicyMap[$gid] = @() }
+                    $groupPolicyMap[$gid] += $policy.displayName
+                }
+            }
+        }
+        Write-Log "Found $policyCount Enterprise policy/policies covering $($groupIds.Count) unique assigned group(s)" -Level 'Info  '
+        if ($groupIds.Count -eq 0) { return }
+
+        # Bulk-resolve group details via getByIds (max 1000 per call)
+        $allGroups = @()
+        $idList    = @($groupIds)
+        for ($i = 0; $i -lt $idList.Count; $i += 1000) {
+            $batch    = $idList[$i..([math]::Min($i + 999, $idList.Count - 1))]
+            $body     = @{ ids = $batch; types = @('group') } | ConvertTo-Json
+            $resolved = Invoke-MgGraphRequest `
+                -Uri         "https://graph.microsoft.com/v1.0/directoryObjects/getByIds?`$select=id,displayName,onPremisesSyncEnabled,groupTypes" `
+                -Method      POST `
+                -Body        $body `
+                -ContentType 'application/json'
+            $allGroups += @($resolved.value | ForEach-Object {
+                [PSCustomObject]@{
+                    id                    = $_.id
+                    displayName           = $_.displayName
+                    onPremisesSyncEnabled = $_.onPremisesSyncEnabled
+                    groupTypes            = $_.groupTypes
+                    policyName            = if ($groupPolicyMap.ContainsKey($_.id)) { $groupPolicyMap[$_.id] -join ', ' } else { '' }
+                }
+            })
+        }
+        return $allGroups
+    }
+    catch {
+        Write-Log "Error fetching Enterprise policy groups: $_" -Level 'FAIL  '
+        throw
     }
 }
 
@@ -934,11 +1010,16 @@ function Invoke-CloudPCReplaceStep {
     try {
         switch ($State.Stage) {
             "Getting User Info" {
+                # Skip Graph lookup if UserId already set (e.g. pre-populated from group member list)
+                if (-not [string]::IsNullOrEmpty($State.UserId)) {
+                    Write-StepLog "[Action] $($State.UserPrincipalName): User info pre-populated (ID: $($State.UserId))" "Status" "Green"
+                    $State.Stage = "Getting Current Cloud PC"
+                    $State.ProgressPercent = 10
+                    break
+                }
                 Write-StepLog "[Action] $($State.UserPrincipalName): Getting user info..." "Status" "Cyan"
                 
-                $uri = "https://graph.microsoft.com/v1.0/users?`$filter=userPrincipalName eq '$($State.UserPrincipalName)'&`$select=id,userPrincipalName,displayName"
-                $userResponse = Invoke-MgGraphRequest -Uri $uri -Method GET
-                $user = $userResponse.value | Select-Object -First 1
+                $user = Get-UserInfo -UserPrincipalName $State.UserPrincipalName
                 
                 if (-not $user) { throw "User not found" }
                 $State.UserId = $user.id
@@ -1054,6 +1135,7 @@ function Invoke-CloudPCReplaceStep {
                     throw "Logic error: No CPC IDs set"
                 }
                 
+                Write-StepLog "[Poll  ] $($State.UserPrincipalName): Polling Graph API - checking CPC grace period status..." "Polling" "Gray"
                 $cloudPCs = Get-CloudPCForUser -UserId $State.UserPrincipalName
                 $trackedCPCs = @($cloudPCs | Where-Object { $State.CloudPCIds -contains $_.id })
                 
@@ -1202,6 +1284,7 @@ function Invoke-CloudPCReplaceStep {
             }
             
             "Waiting for Deprovision" {
+                Write-StepLog "[Poll  ] $($State.UserPrincipalName): Polling Graph API - checking CPC deprovision status..." "Polling" "Gray"
                 $cloudPCs = Get-CloudPCForUser -UserId $State.UserPrincipalName
                 $trackedCPCs = @($cloudPCs | Where-Object { $State.CloudPCIds -contains $_.id })
                 
@@ -1295,6 +1378,7 @@ function Invoke-CloudPCReplaceStep {
             }
             
             "Waiting for Provisioning" {
+                Write-StepLog "[Poll  ] $($State.UserPrincipalName): Polling Graph API - checking new CPC provisioning status..." "Polling" "Gray"
                 $cloudPCs = Get-CloudPCForUser -UserId $State.UserPrincipalName
                 $cloudPCsArray = @($cloudPCs)
                 
@@ -1327,9 +1411,10 @@ function Invoke-CloudPCReplaceStep {
                     Write-StepLog "[Debug ] Identified $($newCPCs.Count) NEW CPC(s) (not in old ID list)" "Debug" "Yellow"
                     
                     if ($newCPCs.Count -gt 0) {
-                        $provisionedCPCs = @($newCPCs | Where-Object { $_.status -eq 'provisioned' })
+                        $provisionedCPCs = @($newCPCs | Where-Object { $_.status -in @('provisioned', 'provisionedWithWarnings') })
                         
                         if ($provisionedCPCs.Count -gt 0) {
+                            $hasWarnings = @($provisionedCPCs | Where-Object { $_.status -eq 'provisionedWithWarnings' })
                             $State.NewCPCs = @($provisionedCPCs | ForEach-Object {
                                 @{
                                     Id = $_.id
@@ -1343,17 +1428,21 @@ function Invoke-CloudPCReplaceStep {
                             }
                             $State.NewCPCName = $newCPCNames -join ", "
                             
-                            Write-StepLog "[Detect] $($State.UserPrincipalName): New Cloud PC(s) provisioned successfully!" "Status" "Green"
+                            Write-StepLog "[Detect] $($State.UserPrincipalName): New Cloud PC(s) provisioned$(if ($hasWarnings.Count) {' (with warnings)'})!" "Status" "Green"
                             foreach ($cpc in $provisionedCPCs) {
                                 $cpcName = if ($cpc.managedDeviceName) { $cpc.managedDeviceName } else { $cpc.displayName }
-                                Write-StepLog "[Detect]   NEW: $cpcName | ID: $($cpc.id) | Plan: $($cpc.servicePlanName)" "Status" "Green"
+                                Write-StepLog "[Detect]   NEW: $cpcName | ID: $($cpc.id) | Plan: $($cpc.servicePlanName) | Status: $($cpc.status)" "Status" "Green"
                             }
                             
-                            $State.Stage = "Complete"
+                            $State.Stage          = "Complete"
                             $State.ProgressPercent = 100
-                            $State.Status = "Success"
-                            $State.EndTime = Get-Date
-                            $State.FinalMessage = "Successfully replaced Cloud PC(s)"
+                            $State.Status         = if ($hasWarnings.Count -gt 0) { "Success (Warnings)" } else { "Success" }
+                            $State.EndTime        = Get-Date
+                            $State.FinalMessage   = if ($hasWarnings.Count -gt 0) {
+                                "Provisioned with warnings - review Cloud PC health in Intune"
+                            } else {
+                                "Successfully replaced Cloud PC(s)"
+                            }
                         }
                         else {
                             $elapsed = (Get-Date) - $State.StageStartTime
@@ -1429,11 +1518,13 @@ Export-ModuleMember -Function @(
     'Start-CloudPCReplace',
     'Get-CloudPCForUser',
     'Get-UserGroupMemberships',
+    'Get-UserInfo',
     'Get-ProvisioningPoliciesForGroup',
     'Stop-CloudPCGracePeriod',
     'Remove-UserFromGroup',
     'Add-UserToGroup',
     'Find-EntraIDGroups',
+    'Get-EnterprisePolicyGroups',
     'Get-GroupMembers',
     'Initialize-Logging',
     'Write-Log',

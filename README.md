@@ -41,8 +41,16 @@ This tool can be used to deprovision an existing Enterprise Cloud PC and then pr
 
 ## Features
 
-### Current Version (v4.3)
+### Current Version (v5.0)
 
+- ✅ **WPF GUI** - Modern WPF interface replacing the original WinForms script
+- ✅ **Policy-Aware Group Picker** - Source and Target groups auto-populated from Enterprise provisioning policies (no searching required)
+- ✅ **Multi-Select Source Groups** - Select multiple source groups; users from all selected groups merge into the users list
+- ✅ **Per-User Source Tracking** - Each queued job remembers its own source group even when multiple are selected
+- ✅ **Live Group Filter** - Filter source/target group lists as you type
+- ✅ **Policy Labels** - Displays the provisioning policy name(s) for the selected group(s)
+- ✅ **Success (Warnings) State** - Separate pill and status for jobs that complete with provisioning warnings
+- ✅ **Summary Pills** - Real-time counts for Active, Monitoring, Queued, Success, Warnings, and Failed
 - ✅ **Modular Architecture** - Core logic in reusable PowerShell module
 - ✅ **Unified Logging** - 6-character aligned tags (Action/Detect/Info/Debug/Poll/API/OK/WARN/FAIL)
 - ✅ **Enhanced CPC Tracking** - Clear OLD/NEW CPC identification with IDs and names
@@ -56,9 +64,6 @@ This tool can be used to deprovision an existing Enterprise Cloud PC and then pr
 - ✅ **Independent Jobs** - Each job has its own source/target groups
 - ✅ **Real-Time Messages** - Timeline tracking with warnings and completion time
 - ✅ **Status Monitoring** - Active/Monitoring/Queued/Success/Failed states
-- ✅ **Three-Panel Layout** - Source, Target, and Users panels
-- ✅ **Live User Search** - Filter users as you type
-- ✅ **Color-Coded Grid** - Visual status indicators
 - ✅ **API Resilience** - Handles status flip-flops and API lag
 - ✅ **Optimized Polling** - 3min monitoring, 1min active stages
 - ✅ **Large Group Support** - Handles 800+ users with pagination
@@ -346,13 +351,14 @@ if ($result.Status -eq 'Success') {
    - Cloud PC operations (get status, end grace period)
    - Group membership management
    - Replace workflow state machine
+   - Provisioning policy discovery (`Get-EnterprisePolicyGroups`)
    - Logging and error handling
 
-2. **Start-CloudPCReplaceGUI.ps1** - Windows Forms GUI
-   - User interface
-   - Configuration management
-   - Progress tracking
-   - Real-time log display
+2. **Start-CloudPCReplaceGUI.ps1** - WPF GUI
+   - Modern WPF interface with policy-aware group picker
+   - Multi-select source groups
+   - Real-time summary pills and status grid
+   - Verbose logging toggle
 
 ### Replace Workflow (9 Stages)
 
@@ -459,6 +465,30 @@ If you encounter issues:
 This tool is provided as-is. Use at your own risk.
 
 ## Version History
+
+### v5.0 (2026-02-28)
+
+**Added**
+- New WPF GUI (`Start-CloudPCReplaceGUI.ps1`) — replaces the original WinForms script
+- Policy-aware group picker: Source and Target listboxes auto-populate from Enterprise provisioning policies on connect; no manual group search required
+- Multi-select source groups (Ctrl/Shift+click): users from all selected groups merge into a single user list; each queued job retains its own source group
+- Same source/target guard for multi-select: skips users already in the target group and reports which were skipped
+- Policy name label below each group listbox (shows policy name, or "(multiple)" when groups span different policies)
+- Live filter on group listboxes (filter as you type)
+- Refresh buttons on both group listboxes (reloads from API and resets all selection state)
+- `Success (Warnings)` status for jobs that provision with non-blocking warnings
+- Separate summary pills for Success and Warnings (both always visible, Warnings shows 0 when none)
+- `Get-EnterprisePolicyGroups` module function: fetches all Enterprise provisioning policies, resolves assigned groups, returns groups with `policyName` property (Frontline policies excluded)
+- Verbose logging filter in `$onLog` callback: Debug and Poll messages suppressed unless verbose is enabled
+
+**Changed**
+- Ending Grace Period stage no longer shows a distinct amber badge — all InProgress stages use the standard blue badge (stage detail visible in Stage column)
+- Dialog button hover effect replaced with subtle custom `ControlTemplate` (previous WPF default was aggressively dark)
+
+**Technical**
+- `$script:groupMemberCache` prevents redundant API calls when toggling multi-select
+- Per-user `sourceGroupId`/`sourceGroupName` on queue entries (stored on `PSCustomObject`, not global variable)
+- ASCII-only string literals in `.psm1` required (Windows-1252 default encoding corrupts multi-byte UTF-8 at `Import-Module`)
 
 ### v4.3 (2026-02-27)
 
