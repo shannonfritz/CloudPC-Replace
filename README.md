@@ -41,7 +41,7 @@ This tool can be used to deprovision an existing Enterprise Cloud PC and then pr
 
 ## Features
 
-### Current Version (v5.0)
+### Current Version (v5.0.1)
 
 - ✅ **WPF GUI** - Modern WPF interface replacing the original WinForms script
 - ✅ **Policy-Aware Group Picker** - Source and Target groups auto-populated from Enterprise provisioning policies (no searching required)
@@ -465,6 +465,11 @@ If you encounter issues:
 This tool is provided as-is. Use at your own risk.
 
 ## Version History
+
+### v5.0.1 (2026-03-08)
+
+**Fixed**
+- Source group member count in log showed wrong number when a group had exactly one member. PowerShell unwraps a single-item pipeline result to a scalar dictionary, so `.Count` returned the number of object properties (5) instead of the number of members. Fixed by logging `$script:groupMemberCache[$g.id].Count` (always a proper array) instead of `$members.Count`.
 
 ### v5.0 (2026-02-28)
 

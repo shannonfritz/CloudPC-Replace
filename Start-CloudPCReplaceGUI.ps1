@@ -12,7 +12,7 @@ using module .\CloudPCReplace.psm1
 
 .NOTES
     Author: Cloud PC Replace Tool
-    Version: 5.0.0
+    Version: 5.0.1
     Date: 2026-02-28
     Requires: CloudPCReplace.psm1 in same directory
 
@@ -30,7 +30,7 @@ param(
 
 $script:MockMode = $MockMode.IsPresent
 
-$script:ToolVersion = "5.0.0"
+$script:ToolVersion = "5.0.1"
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -1418,7 +1418,7 @@ $lstSourceGroups.Add_SelectionChanged({
                 try {
                     $members = Get-GroupMembers -GroupId $g.id | Sort-Object displayName
                     $script:groupMemberCache[$g.id] = @($members)
-                    Write-Log "[Group ] Loaded $($members.Count) member(s) from '$($g.displayName)'"
+                    Write-Log "[Group ] Loaded $($script:groupMemberCache[$g.id].Count) member(s) from '$($g.displayName)'"
                 } catch {
                     Write-Log "[FAIL  ] Error loading members for '$($g.displayName)': $_"
                     $script:groupMemberCache[$g.id] = @()
