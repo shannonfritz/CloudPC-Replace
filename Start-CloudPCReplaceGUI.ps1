@@ -10,10 +10,18 @@ using module .\CloudPCReplace.psm1
     Runs the tool with simulated data instead of real Graph API calls.
     Auto-starts a self-driving demo on launch.
 
+    NOTE: Mock mode is a BEST-EFFORT DEMO/development aid, not a fully
+    supported code path. Its fake data (e.g. Get-ProvisioningPoliciesForGroup
+    returning the same policy for every group) can trip validation in the later
+    swap stages. Mock is fully isolated in the '#region Module API Overrides for
+    Mock Mode' block below (it swaps leaf Graph functions at startup); the
+    production module CloudPCReplace.psm1 contains no mock logic, so mock quirks
+    never affect real runs. Fix on a best-effort basis only.
+
 .NOTES
     Author: Cloud PC Replace Tool
-    Version: 5.0.1
-    Date: 2026-02-28
+    Version: 5.1.1
+    Date: 2026-07-23
     Requires: CloudPCReplace.psm1 in same directory
 
 .EXAMPLE
@@ -30,7 +38,7 @@ param(
 
 $script:MockMode = $MockMode.IsPresent
 
-$script:ToolVersion = "5.0.1"
+$script:ToolVersion = "5.1.1"
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -43,6 +51,7 @@ Import-Module $modulePath -Force
 #region Global State
 $script:cancellationToken  = $false
 $script:replaceRunning     = $false
+$script:pausing            = $false
 $script:sourceGroupId      = $null
 $script:sourceGroupName    = $null
 $script:targetGroupId      = $null
@@ -54,11 +63,16 @@ $script:maxConcurrent      = 2
 $script:verboseLogging     = $false
 $script:LogFilePath        = $null
 $script:allPolicyGroups    = @()
+$script:scheduledStartTime = $null
+$script:scheduledStopTime  = $null
+$script:scheduleArmed      = $false
+$script:lastKeepAlive      = $null
 
 $script:gracePeriodTimeoutMinutes        = 15
 $script:endingGracePeriodTimeoutMinutes  = 30
 $script:deprovisionTimeoutMinutes        = 60
 $script:provisioningTimeoutMinutes       = 90
+$script:mockPollInterval                 = 10   # Seconds between polls in MOCK MODE only (production uses 60s / 180s)
 #endregion
 
 #region Mock Data
@@ -170,6 +184,12 @@ function Write-PollingLog{ param([string]$Message, [string]$Color = 'Gray')  if 
 #endregion
 
 #region Module API Overrides for Mock Mode
+# BEST-EFFORT DEMO ONLY. This entire block runs only when -MockMode is passed and
+# swaps the leaf Graph API functions for fakes. Production code paths and the
+# CloudPCReplace.psm1 state machine are untouched by this, so it is safe to edit
+# freely here. Known limitation: the stubbed data can trip validation in the later
+# swap stages (e.g. same provisioning policy returned for all groups). Not a
+# supported code path — do not invest heavily.
 if ($script:MockMode) {
     # Alias mock state globally so module-scope overrides can access it (hashtable = reference type)
     $global:MockCPCState = $script:MockCPCState
@@ -373,6 +393,17 @@ function Get-QueuedRange {
 }
 
 
+function Format-Duration {
+    param([TimeSpan]$Span)
+    if ($Span.Ticks -lt 0) { $Span = [TimeSpan]::Zero }
+    $h = [math]::Floor($Span.TotalHours)
+    $m = $Span.Minutes
+    $s = $Span.Seconds
+    if ($h -gt 0)     { return ('{0}h{1:00}m{2:00}s' -f $h, $m, $s) }
+    elseif ($m -gt 0) { return ('{0}m{1:00}s' -f $m, $s) }
+    else              { return ('{0}s' -f $s) }
+}
+
 function Update-JobGrid {
     param([UserReplaceState]$State)
     $script:Window.Dispatcher.Invoke([Action]{
@@ -385,7 +416,11 @@ function Update-JobGrid {
             $item.Stage      = Get-StageDisplay $State.Stage
             $item.Status     = $displayStatus
             $item.NextPoll   = $State.NextPollDisplay
-            $item.Messages   = if ($State.ErrorMessage) { $State.ErrorMessage } else { "" }
+            $item.Messages   = if ($State.Status -in @('Success','Success (Warnings)') -and $State.StartTime -gt [DateTime]::MinValue -and $State.EndTime -gt [DateTime]::MinValue) {
+                $dur = "Completed in $(Format-Duration ($State.EndTime - $State.StartTime))"
+                if ($State.Status -eq 'Success (Warnings)') { "$dur — provisioned with warnings, review in Intune" } else { $dur }
+            } elseif ($State.Status -eq 'InProgress' -and $State.StatusNote) { $State.StatusNote
+            } elseif ($State.ErrorMessage) { $State.ErrorMessage } else { "" }
             $badge = Get-StatusBadge -Status $State.Status -Stage $State.Stage
             $item.BadgeColor = $badge.Bg
             $item.BadgeFg    = $badge.Fg
@@ -859,6 +894,7 @@ $script:JobItems = New-Object System.Collections.ObjectModel.ObservableCollectio
                             <Button x:Name="btnClearQueue" Style="{StaticResource NeutralBtn}" Margin="0,0,12,0" IsEnabled="False">
                                 <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE894;" FontFamily="Segoe MDL2 Assets" FontSize="11" Margin="0,0,5,0" VerticalAlignment="Center"/><TextBlock Text="Clear" VerticalAlignment="Center"/></StackPanel>
                             </Button>
+                            <Button x:Name="btnSchedule"   Content="⏱ Schedule" Style="{StaticResource NeutralBtn}" Margin="0,0,4,0" IsEnabled="False"/>
                             <Button x:Name="btnStart"      Content="▶ Start"  Style="{StaticResource SuccessBtn}" Margin="0,0,4,0" IsEnabled="False"/>
                             <Button x:Name="btnStop"       Content="⏹ Stop"   Style="{StaticResource DangerBtn}"  Margin="0,0,12,0" IsEnabled="False"/>
                             <Button x:Name="btnExport"     Content="Export CSV" Style="{StaticResource NeutralBtn}"/>
@@ -887,6 +923,12 @@ $script:JobItems = New-Object System.Collections.ObjectModel.ObservableCollectio
                         </Border>
                         <Border Background="#FEE2E2" CornerRadius="10" Padding="8,3">
                             <TextBlock x:Name="lblStatFailed"  Text="✗ 0 Failed"      FontSize="11" Foreground="#991B1B"/>
+                        </Border>
+                        <Border x:Name="brdStatStartsIn" Background="#EDE9FE" CornerRadius="10" Padding="8,3" Margin="6,0,0,0" Visibility="Collapsed">
+                            <TextBlock x:Name="lblStatStartsIn" Text="⏱ Starts in --:--:--" FontSize="11" Foreground="#6D28D9"/>
+                        </Border>
+                        <Border x:Name="brdStatStopsIn" Background="#FFE4E6" CornerRadius="10" Padding="8,3" Margin="6,0,0,0" Visibility="Collapsed">
+                            <TextBlock x:Name="lblStatStopsIn" Text="⏸ Pauses in --:--:--" FontSize="11" Foreground="#BE123C"/>
                         </Border>
                     </StackPanel>
 
@@ -1015,6 +1057,7 @@ $lstUsers          = $script:Window.FindName('lstUsers')
 $lblUsersCount     = $script:Window.FindName('lblUsersCount')
 $lblConnectionStatus = $script:Window.FindName('lblConnectionStatus')
 $btnAddToQueue     = $script:Window.FindName('btnAddToQueue')
+$btnSchedule       = $script:Window.FindName('btnSchedule')
 $btnStart          = $script:Window.FindName('btnStart')
 $btnStop           = $script:Window.FindName('btnStop')
 $btnClearQueue     = $script:Window.FindName('btnClearQueue')
@@ -1039,6 +1082,10 @@ $lblStatSuccess = $script:Window.FindName('lblStatSuccess')
 $lblStatWarning = $script:Window.FindName('lblStatWarning')
 $brdStatWarning = $script:Window.FindName('brdStatWarning')
 $lblStatFailed  = $script:Window.FindName('lblStatFailed')
+$brdStatStartsIn = $script:Window.FindName('brdStatStartsIn')
+$lblStatStartsIn = $script:Window.FindName('lblStatStartsIn')
+$brdStatStopsIn  = $script:Window.FindName('brdStatStopsIn')
+$lblStatStopsIn  = $script:Window.FindName('lblStatStopsIn')
 $rtbLog            = $script:Window.FindName('rtbLog')
 $chkAutoScroll     = $script:Window.FindName('chkAutoScroll')
 
@@ -1119,6 +1166,189 @@ function Show-AppDialog {
     }
     $dlg.ShowDialog() | Out-Null
     return $script:_dlgResult
+}
+
+function Resolve-ScheduleTime {
+    param([string]$Mode, [string]$AtText, [string]$InText, [string]$Unit, [datetime]$Base)
+    if ($Mode -eq 'at') {
+        $parsed = [datetime]::MinValue
+        if (-not [DateTime]::TryParse($AtText, [ref]$parsed)) { return $null }
+        $t = $Base.Date.AddHours($parsed.Hour).AddMinutes($parsed.Minute)
+        if ($t -le $Base) { $t = $t.AddDays(1) }
+        return $t
+    } else {
+        $n = 0.0
+        if (-not [double]::TryParse($InText, [ref]$n)) { return $null }
+        if ($n -le 0) { return $null }
+        if ($Unit -eq 'Hours') { return $Base.AddHours($n) } else { return $Base.AddMinutes($n) }
+    }
+}
+
+function Show-ScheduleDialog {
+    [xml]$dlgXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Schedule Queue" SizeToContent="WidthAndHeight"
+        MinWidth="440" WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize" FontFamily="Segoe UI" FontSize="13" Background="White">
+    <Window.Resources>
+        <Style x:Key="PrimaryBtn" TargetType="Button">
+            <Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontWeight" Value="SemiBold"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+                <Border Background="{TemplateBinding Background}" CornerRadius="4"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+                <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#106EBE"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter Property="Background" Value="#A0C7E8"/></Trigger></ControlTemplate.Triggers>
+            </ControlTemplate></Setter.Value></Setter>
+        </Style>
+        <Style x:Key="SecondaryBtn" TargetType="Button">
+            <Setter Property="Background" Value="White"/><Setter Property="Foreground" Value="#1F1F1F"/>
+            <Setter Property="FontWeight" Value="SemiBold"/><Setter Property="BorderBrush" Value="#CCCCCC"/><Setter Property="BorderThickness" Value="1"/><Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+                <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="4"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+                <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#F0F0F0"/></Trigger></ControlTemplate.Triggers>
+            </ControlTemplate></Setter.Value></Setter>
+        </Style>
+    </Window.Resources>
+    <Border Padding="24,20">
+        <StackPanel>
+            <TextBlock Text="Schedule Queue" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,2"/>
+            <TextBlock Text="The app must stay open until the scheduled time." FontSize="11" Foreground="#888" Margin="0,0,0,16"/>
+
+            <TextBlock Text="START" FontSize="11" FontWeight="Bold" Foreground="#666" Margin="0,0,0,8"/>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                <RadioButton x:Name="rbStartIn" GroupName="startMode" Content="Start in" IsChecked="True" VerticalAlignment="Center" Width="80"/>
+                <TextBox x:Name="txtStartIn" Text="30" Width="60" Margin="0,0,6,0" Height="26" VerticalContentAlignment="Center"/>
+                <ComboBox x:Name="cmbStartUnit" Width="90" Height="26" SelectedIndex="0">
+                    <ComboBoxItem Content="Minutes"/><ComboBoxItem Content="Hours"/>
+                </ComboBox>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                <RadioButton x:Name="rbStartAt" GroupName="startMode" Content="Start at" VerticalAlignment="Center" Width="80"/>
+                <TextBox x:Name="txtStartAt" Text="22:00" Width="80" Height="26" VerticalContentAlignment="Center"/>
+                <TextBlock Text="(HH:mm, 24-hr)" FontSize="11" Foreground="#888" VerticalAlignment="Center" Margin="8,0,0,0"/>
+            </StackPanel>
+
+            <CheckBox x:Name="chkEnableStop" Content="Also schedule a pause" Margin="0,0,0,8" FontWeight="SemiBold"/>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                <RadioButton x:Name="rbStopIn" GroupName="stopMode" Content="Pause in" IsChecked="True" IsEnabled="False" VerticalAlignment="Center" Width="80"/>
+                <TextBox x:Name="txtStopIn" Text="6" Width="60" Margin="0,0,6,0" Height="26" IsEnabled="False" VerticalContentAlignment="Center"/>
+                <ComboBox x:Name="cmbStopUnit" Width="90" Height="26" SelectedIndex="1" IsEnabled="False">
+                    <ComboBoxItem Content="Minutes"/><ComboBoxItem Content="Hours"/>
+                </ComboBox>
+                <TextBlock Text="(after start)" FontSize="11" Foreground="#888" VerticalAlignment="Center" Margin="8,0,0,0"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                <RadioButton x:Name="rbStopAt" GroupName="stopMode" Content="Pause at" IsEnabled="False" VerticalAlignment="Center" Width="80"/>
+                <TextBox x:Name="txtStopAt" Text="04:00" Width="80" Height="26" IsEnabled="False" VerticalContentAlignment="Center"/>
+                <TextBlock Text="(HH:mm, 24-hr)" FontSize="11" Foreground="#888" VerticalAlignment="Center" Margin="8,0,0,0"/>
+            </StackPanel>
+
+            <Border Background="#F3F4F6" CornerRadius="6" Padding="12,10" Margin="0,0,0,16">
+                <TextBlock x:Name="lblSummary" TextWrapping="Wrap" FontSize="12" Foreground="#374151"/>
+            </Border>
+
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="btnSched" Content="Schedule" Width="100" Height="32" Margin="0,0,8,0" Style="{StaticResource PrimaryBtn}"/>
+                <Button x:Name="btnCancel" Content="Cancel" Width="90" Height="32" Style="{StaticResource SecondaryBtn}"/>
+            </StackPanel>
+        </StackPanel>
+    </Border>
+</Window>
+'@
+    $reader = [System.Xml.XmlNodeReader]::new($dlgXaml)
+    $dlg = [System.Windows.Markup.XamlReader]::Load($reader)
+    $dlg.Owner = $script:Window
+
+    $rbStartIn = $dlg.FindName('rbStartIn'); $rbStartAt = $dlg.FindName('rbStartAt')
+    $txtStartIn = $dlg.FindName('txtStartIn'); $cmbStartUnit = $dlg.FindName('cmbStartUnit'); $txtStartAt = $dlg.FindName('txtStartAt')
+    $chkEnableStop = $dlg.FindName('chkEnableStop')
+    $rbStopIn = $dlg.FindName('rbStopIn'); $rbStopAt = $dlg.FindName('rbStopAt')
+    $txtStopIn = $dlg.FindName('txtStopIn'); $cmbStopUnit = $dlg.FindName('cmbStopUnit'); $txtStopAt = $dlg.FindName('txtStopAt')
+    $lblSummary = $dlg.FindName('lblSummary')
+    $btnSched = $dlg.FindName('btnSched'); $btnCancel = $dlg.FindName('btnCancel')
+
+    $script:_schedResult = $null
+    $script:_schedStart  = $null
+    $script:_schedStop   = $null
+
+    $recalc = {
+        $now = Get-Date
+        $startMode = if ($rbStartAt.IsChecked) { 'at' } else { 'in' }
+        $startUnit = if ($cmbStartUnit.SelectedItem) { $cmbStartUnit.SelectedItem.Content } else { 'Minutes' }
+        $startAt = Resolve-ScheduleTime -Mode $startMode -AtText $txtStartAt.Text -InText $txtStartIn.Text -Unit $startUnit -Base $now
+
+        $stopEnabled = [bool]$chkEnableStop.IsChecked
+        $stopAt = $null
+        $stopErr = $false
+        if ($stopEnabled -and $startAt) {
+            $stopMode = if ($rbStopAt.IsChecked) { 'at' } else { 'in' }
+            $stopUnit = if ($cmbStopUnit.SelectedItem) { $cmbStopUnit.SelectedItem.Content } else { 'Hours' }
+            if ($stopMode -eq 'in') {
+                $stopAt = Resolve-ScheduleTime -Mode 'in' -InText $txtStopIn.Text -Unit $stopUnit -Base $startAt
+            } else {
+                $parsed = [datetime]::MinValue
+                if ([DateTime]::TryParse($txtStopAt.Text, [ref]$parsed)) {
+                    $t = $now.Date.AddHours($parsed.Hour).AddMinutes($parsed.Minute)
+                    while ($t -le $startAt) { $t = $t.AddDays(1) }
+                    $stopAt = $t
+                }
+            }
+            if (-not $stopAt -or $stopAt -le $startAt) { $stopErr = $true }
+        }
+
+        $script:_schedStart = $startAt
+        $script:_schedStop  = if ($stopEnabled) { $stopAt } else { $null }
+
+        if (-not $startAt) {
+            $lblSummary.Text = "Enter a valid start time."
+            $btnSched.IsEnabled = $false
+        } elseif ($stopErr) {
+            $lblSummary.Text = "Pause time must be after the start time."
+            $btnSched.IsEnabled = $false
+        } else {
+            $s = "Start:    " + $startAt.ToString('ddd h:mm tt')
+            if ($script:_schedStop) {
+                $rt = $script:_schedStop - $startAt
+                $rtStr = "{0}h {1}m" -f [int][math]::Floor($rt.TotalHours), $rt.Minutes
+                $s += "`nPause:    " + $script:_schedStop.ToString('ddd h:mm tt')
+                $s += "`nRuntime:  " + $rtStr
+            } else {
+                $s += "`nRuns until done"
+            }
+            $lblSummary.Text = $s
+            $btnSched.IsEnabled = $true
+        }
+    }
+
+    $toggleStop = {
+        $en = [bool]$chkEnableStop.IsChecked
+        $rbStopIn.IsEnabled = $en; $rbStopAt.IsEnabled = $en
+        $txtStopIn.IsEnabled = $en; $cmbStopUnit.IsEnabled = $en; $txtStopAt.IsEnabled = $en
+        & $recalc
+    }
+
+    $rbStartIn.Add_Checked($recalc); $rbStartAt.Add_Checked($recalc)
+    $txtStartIn.Add_TextChanged($recalc); $txtStartAt.Add_TextChanged($recalc)
+    $cmbStartUnit.Add_SelectionChanged($recalc)
+    $chkEnableStop.Add_Checked($toggleStop); $chkEnableStop.Add_Unchecked($toggleStop)
+    $rbStopIn.Add_Checked($recalc); $rbStopAt.Add_Checked($recalc)
+    $txtStopIn.Add_TextChanged($recalc); $txtStopAt.Add_TextChanged($recalc)
+    $cmbStopUnit.Add_SelectionChanged($recalc)
+
+    $btnSched.Add_Click([System.Windows.RoutedEventHandler]{
+        param($s, $e)
+        $script:_schedResult = @{ StartAt = $script:_schedStart; StopAt = $script:_schedStop }
+        [System.Windows.Window]::GetWindow($s).Close()
+    })
+    $btnCancel.Add_Click([System.Windows.RoutedEventHandler]{
+        param($s, $e)
+        $script:_schedResult = $null
+        [System.Windows.Window]::GetWindow($s).Close()
+    })
+
+    & $recalc
+    $dlg.ShowDialog() | Out-Null
+    return $script:_schedResult
 }
 
 function Write-Log {
@@ -1590,6 +1820,7 @@ $btnAddToQueue.Add_Click({
 
     if ($added -gt 0) {
         $btnStart.IsEnabled      = $true
+        if (-not $script:scheduleArmed -and -not $script:replaceRunning) { $btnSchedule.IsEnabled = $true }
         $btnClearQueue.IsEnabled = $true
         Write-Log "[Info  ] Added $added user(s) to queue. Total: $($script:userStates.Count)"
         Update-SummaryLabel
@@ -1655,18 +1886,30 @@ $btnRemove.Add_Click({
 })
 
 $btnClearQueue.Add_Click({
-    $queued = @($script:JobItems | Where-Object { $_.Status -eq 'Queued' })
-    if ($queued.Count -eq 0) { return }
-    $confirm = Show-AppDialog -Message "Clear $($queued.Count) queued job(s)?" -Title "Confirm" -Icon Question -Buttons YesNo
+    # Clear all non-running jobs from the grid (Queued, Failed, Success, etc.); leave InProgress jobs alone.
+    $clearable = @($script:JobItems | Where-Object { $_.Status -ne 'InProgress' })
+    $running   = @($script:JobItems | Where-Object { $_.Status -eq 'InProgress' }).Count
+    if ($clearable.Count -eq 0) {
+        Show-AppDialog -Message "There are no jobs to clear. Running jobs cannot be cleared." -Title "Nothing to Clear" -Icon Info
+        return
+    }
+    $msg = "Clear $($clearable.Count) job(s) from the grid?"
+    if ($running -gt 0) { $msg += "`n`n$running running job(s) will be left in place." }
+    $confirm = Show-AppDialog -Message $msg -Title "Confirm" -Icon Question -Buttons YesNo
     if ($confirm -ne 'Yes') { return }
-    foreach ($item in $queued) {
+    foreach ($item in $clearable) {
         $script:userStates.Remove($item.UPN)
         $script:JobItems.Remove($item)
     }
-    $btnClearQueue.IsEnabled = $false
-    if ($script:JobItems.Count -eq 0) { $btnStart.IsEnabled = $false }
+    # Re-evaluate button states based on what remains
+    $remainingClearable = @($script:JobItems | Where-Object { $_.Status -ne 'InProgress' }).Count
+    $btnClearQueue.IsEnabled = ($remainingClearable -gt 0)
+    $stillQueued = @($script:userStates.Values | Where-Object { $_.Status -eq 'Queued' }).Count
+    if ($stillQueued -eq 0 -and -not $script:replaceRunning -and -not $script:scheduleArmed) {
+        $btnStart.IsEnabled = $false; $btnSchedule.IsEnabled = $false
+    }
     Update-SummaryLabel
-    Write-Log "[Info  ] Cleared $($queued.Count) queued job(s)"
+    Write-Log "[Info  ] Cleared $($clearable.Count) job(s) from the grid"
 })
 
 function Update-MoveButtonStates {
@@ -1753,24 +1996,245 @@ $btnMoveDown.Add_Click(   { Move-Job 'Down' })
 $btnMoveTop.Add_Click(    { Move-Job 'Top' })
 $btnMoveBottom.Add_Click( { Move-Job 'Bottom' })
 
-# Start / Stop
-$btnStart.Add_Click({
+# Start / Pause / Stop / Schedule
+# Centralized run-control button states. 'idle' = not running (Start begins/resumes),
+# 'running' = jobs processing (Start acts as Pause), 'pausing' = graceful drain in progress.
+function Set-RunButtons {
+    param([ValidateSet('idle','running','pausing')][string]$Mode)
+    switch ($Mode) {
+        'idle' {
+            $btnStart.Content   = "▶ Start"
+            # Enabled if anything is resumable (Queued, or InProgress frozen by a Stop)
+            $resumable = ($script:userStates.Values | Where-Object { $_.Status -in @('Queued','InProgress') } | Measure-Object).Count -gt 0
+            $btnStart.IsEnabled = $resumable
+            $btnStop.IsEnabled  = $false
+            $hasQueued = ($script:userStates.Values | Where-Object { $_.Status -eq 'Queued' } | Measure-Object).Count -gt 0
+            $btnSchedule.IsEnabled = ($hasQueued -and -not $script:scheduleArmed)
+        }
+        'running' {
+            $btnStart.Content      = "⏸ Pause"
+            $btnStart.IsEnabled     = $true
+            $btnStop.IsEnabled      = $true
+            $btnSchedule.IsEnabled  = $false
+        }
+        'pausing' {
+            $btnStart.Content      = "⏸ Pausing…"
+            $btnStart.IsEnabled     = $false   # can't re-pause; Stop still available to force-abort
+            $btnStop.IsEnabled      = $true
+            $btnSchedule.IsEnabled  = $false
+        }
+    }
+}
+
+function Start-Processing {
     $script:replaceRunning    = $true
     $script:cancellationToken = $false
-    $btnStart.IsEnabled = $false
-    $btnStop.IsEnabled  = $true
+    $script:pausing           = $false
+    Set-RunButtons -Mode running
     Write-Log "[Action] Processing started"
     $script:ProcessTimer.Start()
+}
+
+# Graceful drain: stop starting NEW jobs, let in-progress jobs run to completion,
+# then halt (leftover Queued jobs stay queued). The ProcessTimer keeps running until
+# the tick's drain-complete check clears it.
+function Suspend-Processing {
+    if (-not $script:replaceRunning) { return }
+    $script:cancellationToken = $true
+    $script:pausing           = $true
+    $inProgress = ($script:userStates.Values | Where-Object { $_.Status -eq 'InProgress' } | Measure-Object).Count
+    if ($inProgress -gt 0) {
+        Set-RunButtons -Mode pausing
+        Write-Log "[Action] Pause requested - no new jobs will start; $inProgress in-progress job(s) will run to completion"
+    } else {
+        # Nothing in flight — halt immediately
+        $script:ProcessTimer.Stop()
+        $script:replaceRunning = $false
+        $script:pausing        = $false
+        Set-RunButtons -Mode idle
+        Write-Log "[Action] Paused - queue halted; no jobs were in progress"
+    }
+}
+
+# Hard stop: freeze immediately. In-progress jobs stay at their current step and do
+# NOT continue until the queue is resumed with Start.
+function Stop-Processing {
+    $script:cancellationToken = $true
+    $script:pausing           = $false
+    $script:ProcessTimer.Stop()
+    $script:replaceRunning = $false
+    Set-RunButtons -Mode idle
+    Write-Log "[WARN  ] Processing stopped - in-progress jobs frozen at their current step (press Start to resume)"
+}
+
+function Set-ScheduleChips {
+    $now = Get-Date
+    if ($script:scheduleArmed -and $script:scheduledStartTime) {
+        $r = $script:scheduledStartTime - $now
+        if ($r.TotalSeconds -lt 0) { $r = [TimeSpan]::Zero }
+        $lblStatStartsIn.Text = ("⏱ Starts in {0:D2}:{1:D2}:{2:D2}" -f [int][math]::Floor($r.TotalHours), $r.Minutes, $r.Seconds)
+        $brdStatStartsIn.Visibility = 'Visible'
+    } else {
+        $brdStatStartsIn.Visibility = 'Collapsed'
+    }
+    if ($script:scheduledStopTime -and ($script:replaceRunning -or $script:scheduleArmed)) {
+        $r = $script:scheduledStopTime - $now
+        if ($r.TotalSeconds -lt 0) { $r = [TimeSpan]::Zero }
+        $lblStatStopsIn.Text = ("⏸ Pauses in {0:D2}:{1:D2}:{2:D2}" -f [int][math]::Floor($r.TotalHours), $r.Minutes, $r.Seconds)
+        $brdStatStopsIn.Visibility = 'Visible'
+    } else {
+        $brdStatStopsIn.Visibility = 'Collapsed'
+    }
+}
+
+function Set-Schedule {
+    param([datetime]$StartAt, $StopAt)
+    $script:scheduledStartTime = $StartAt
+    $script:scheduledStopTime  = $StopAt
+    $script:scheduleArmed      = $true
+    $script:lastKeepAlive      = Get-Date
+    $btnSchedule.IsEnabled = $false
+    $btnStart.IsEnabled    = $true    # allows "start now"
+    $btnStop.IsEnabled     = $true    # allows "cancel schedule"
+    if (-not $script:ScheduleTimer.IsEnabled) { $script:ScheduleTimer.Start() }
+    Set-ScheduleChips
+    $stopTxt = if ($StopAt) { " · pause $($StopAt.ToString('ddd h:mm tt'))" } else { " · runs until done" }
+    Write-Log "[Action] Queue scheduled: start $($StartAt.ToString('ddd h:mm tt'))$stopTxt"
+}
+
+function Clear-Schedule {
+    param([string]$Reason = "cancelled")
+    $script:scheduleArmed      = $false
+    $script:scheduledStartTime = $null
+    $script:scheduledStopTime  = $null
+    if ($script:ScheduleTimer) { $script:ScheduleTimer.Stop() }
+    $brdStatStartsIn.Visibility = 'Collapsed'
+    $brdStatStopsIn.Visibility  = 'Collapsed'
+    $hasQueued = ($script:userStates.Values | Where-Object { $_.Status -eq 'Queued' } | Measure-Object).Count -gt 0
+    $btnStart.IsEnabled    = $hasQueued
+    $btnSchedule.IsEnabled = $hasQueued
+    $btnStop.IsEnabled     = $false
+    Write-Log "[Info  ] Scheduled run $Reason"
+}
+
+function Clear-ScheduledStop {
+    # Release a scheduled auto-pause "cap" once a run ends on its own (before the cap fires),
+    # so a leftover stop time can't later pause an unrelated run or leave the ScheduleTimer ticking.
+    if (-not $script:scheduledStopTime) { return }
+    $script:scheduledStopTime = $null
+    $brdStatStopsIn.Visibility = 'Collapsed'
+    if (-not $script:scheduleArmed -and $script:ScheduleTimer) { $script:ScheduleTimer.Stop() }
+}
+
+$btnSchedule.Add_Click({
+    $result = Show-ScheduleDialog
+    if ($result) { Set-Schedule -StartAt $result.StartAt -StopAt $result.StopAt }
+})
+
+$btnStart.Add_Click({
+    # While running, this button acts as Pause (graceful drain)
+    if ($script:replaceRunning) {
+        Suspend-Processing
+        return
+    }
+    if ($script:scheduleArmed) {
+        # "Start now" overrides the pending start but preserves any scheduled stop
+        $script:scheduleArmed      = $false
+        $script:scheduledStartTime = $null
+        $brdStatStartsIn.Visibility = 'Collapsed'
+        Write-Log "[Info  ] Scheduled start overridden - starting now"
+        if (-not $script:scheduledStopTime) { $script:ScheduleTimer.Stop() }
+    }
+    Start-Processing
 })
 
 $btnStop.Add_Click({
-    $script:cancellationToken = $true
-    $btnStop.IsEnabled  = $false
-    $btnStart.IsEnabled = $true
-    Write-Log "[WARN  ] Processing stop requested - jobs will finish their current step"
-    $script:ProcessTimer.Stop()
-    $script:replaceRunning = $false
+    if ($script:scheduleArmed) {
+        Clear-Schedule -Reason "cancelled by user"
+        return
+    }
+    # Confirm hard stop only when jobs are actually mid-swap (freezing them has real consequences)
+    $inProgress = ($script:userStates.Values | Where-Object { $_.Status -eq 'InProgress' } | Measure-Object).Count
+    if ($inProgress -gt 0) {
+        $msg = "Stop now? $inProgress job(s) in progress will be frozen at their current step and will not finish - a Cloud PC mid-swap could be left deprovisioned with no replacement.`n`n"
+        if (-not $script:pausing) { $msg += "To let in-progress jobs finish first, use the Pause button instead.`n`n" }
+        $msg += "Queued jobs stay queued either way. Stop anyway?"
+        $confirm = Show-AppDialog -Message $msg -Title "Stop Processing?" -Icon Warning -Buttons YesNo
+        if ($confirm -ne 'Yes') { return }
+    }
+    Stop-Processing
+    if ($script:scheduledStopTime -or $script:ScheduleTimer.IsEnabled) {
+        $script:scheduledStopTime = $null
+        $script:ScheduleTimer.Stop()
+        $brdStatStopsIn.Visibility = 'Collapsed'
+    }
 })
+
+#region Schedule Timer (DispatcherTimer - drives armed start/stop + token keep-alive)
+$script:ScheduleTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$script:ScheduleTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:ScheduleTimer.Add_Tick({
+    $now = Get-Date
+
+    # Token keep-alive while waiting for a scheduled start
+    if ($script:scheduleArmed -and -not $script:MockMode) {
+        if (-not $script:lastKeepAlive -or ($now - $script:lastKeepAlive).TotalMinutes -ge 10) {
+            $script:lastKeepAlive = $now
+            try {
+                Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id&$top=1' -ErrorAction Stop | Out-Null
+                if ($script:verboseLogging) { Write-Log "[Debug ] Token keep-alive OK" }
+            } catch {
+                Write-Log "[WARN  ] Token keep-alive failed - Graph connection may have expired. Reconnect before the scheduled start."
+            }
+        }
+    }
+
+    # Fire scheduled START
+    if ($script:scheduleArmed -and $script:scheduledStartTime -and $now -ge $script:scheduledStartTime) {
+        $script:scheduleArmed      = $false
+        $script:scheduledStartTime = $null
+        $brdStatStartsIn.Visibility = 'Collapsed'
+
+        $preflightOk = $true
+        if (-not $script:MockMode) {
+            $ctx = $null
+            try { $ctx = Get-MgContext } catch {}
+            if (-not $ctx) { $preflightOk = $false }
+        }
+
+        if ($preflightOk) {
+            Write-Log "[Action] Scheduled start time reached - starting queue"
+            Start-Processing
+        } else {
+            Write-Log "[FAIL  ] Scheduled start aborted - Graph connection lost. Jobs remain queued."
+            $script:scheduledStopTime = $null
+            $script:ScheduleTimer.Stop()
+            $brdStatStopsIn.Visibility = 'Collapsed'
+            $hasQueued = ($script:userStates.Values | Where-Object { $_.Status -eq 'Queued' } | Measure-Object).Count -gt 0
+            $btnStart.IsEnabled    = $hasQueued
+            $btnSchedule.IsEnabled = $hasQueued
+            $btnStop.IsEnabled     = $false
+            Show-AppDialog -Message "The scheduled start could not begin because the Microsoft Graph connection was lost or expired.`n`nYour jobs are still queued. Please reconnect and start manually." -Title "Scheduled Start Failed" -Icon Error
+        }
+    }
+
+    # Fire scheduled STOP
+    if ($script:scheduledStopTime -and $script:replaceRunning -and $now -ge $script:scheduledStopTime) {
+        $script:scheduledStopTime = $null
+        Write-Log "[Action] Scheduled stop time reached - pausing queue (in-progress jobs will run to completion)"
+        Suspend-Processing
+        $brdStatStopsIn.Visibility = 'Collapsed'
+    }
+
+    Set-ScheduleChips
+
+    # Nothing left to drive? Stop the timer.
+    if (-not $script:scheduleArmed -and -not $script:scheduledStopTime) {
+        $script:ScheduleTimer.Stop()
+    }
+})
+#endregion
+
 
 # Export
 $btnExport.Add_Click({
@@ -1843,7 +2307,7 @@ $script:ProcessTimer.Add_Tick({
     # Process each active job
     foreach ($state in @($script:userStates.Values | Where-Object { $_.Status -eq 'InProgress' })) {
         $isImmediate = $state.Stage -in @('Getting User Info','Getting Current Cloud PC','Removing from Source','Adding to Target','Complete')
-        $pollInterval = if ($state.Stage -eq 'Waiting for Provisioning') { 180 } else { 60 }
+        $pollInterval = if ($script:MockMode) { $script:mockPollInterval } elseif ($state.Stage -eq 'Waiting for Provisioning') { 180 } else { 60 }
         $secondsSinceLastPoll = ($now - $state.LastPollTime).TotalSeconds
 
         if ($isImmediate -or $secondsSinceLastPoll -ge $pollInterval) {
@@ -1896,13 +2360,27 @@ $script:ProcessTimer.Add_Tick({
 
     Update-SummaryLabel
 
-    # Check if all done
-    $anyActive = $script:userStates.Values | Where-Object { $_.Status -in @('InProgress','Queued') }
-    if ($script:replaceRunning -and -not $anyActive) {
+    # Check for pause-drain completion or full completion
+    $anyInProgress = ($script:userStates.Values | Where-Object { $_.Status -eq 'InProgress' } | Measure-Object).Count -gt 0
+    $queuedCountNow = ($script:userStates.Values | Where-Object { $_.Status -eq 'Queued' } | Measure-Object).Count
+
+    if ($script:pausing -and -not $anyInProgress) {
+        # Graceful drain finished — halt, leaving any queued jobs in place to resume later
+        $script:ProcessTimer.Stop()
+        $script:replaceRunning    = $false
+        $script:pausing           = $false
+        $script:cancellationToken = $false
+        Clear-ScheduledStop
+        Set-RunButtons -Mode idle
+        $qMsg = if ($queuedCountNow -gt 0) { " - $queuedCountNow job(s) still queued (press Start to resume)" } else { "" }
+        Write-Log "[Action] Paused - all in-progress jobs finished$qMsg"
+        Update-SummaryLabel
+    }
+    elseif ($script:replaceRunning -and -not $anyInProgress -and $queuedCountNow -eq 0) {
         $script:ProcessTimer.Stop()
         $script:replaceRunning = $false
-        $btnStart.IsEnabled    = $false
-        $btnStop.IsEnabled     = $false
+        Clear-ScheduledStop
+        Set-RunButtons -Mode idle
         Write-Log "[OK    ] === ALL JOBS COMPLETE ==="
         Update-SummaryLabel
     }
@@ -1923,7 +2401,11 @@ if ($script:MockMode) {
                 $btnConnect.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
             }
             3  {
+                # Filter BOTH lists before selecting anything — the Search button does a
+                # hard refresh that resets all selection state, so it must run before
+                # any source/target group is picked (otherwise it wipes the selection).
                 $txtSearchSource.Text = "w365"
+                $txtSearchTarget.Text = "w365"
                 $btnSearchSource.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
             }
             5  {
@@ -1935,10 +2417,6 @@ if ($script:MockMode) {
                 }
             }
             7  {
-                $txtSearchTarget.Text = "w365"
-                $btnSearchTarget.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
-            }
-            9  {
                 # Select second non-warning target group (different from source)
                 $picked = 0
                 for ($i = 0; $i -lt $lstTargetGroups.Items.Count; $i++) {
@@ -1948,7 +2426,7 @@ if ($script:MockMode) {
                     }
                 }
             }
-            11 {
+            9  {
                 # Select first 2 users
                 $lstUsers.UnselectAll()
                 $lstUsers.SelectedIndex = 0
@@ -1957,10 +2435,10 @@ if ($script:MockMode) {
                 }
                 Update-AddToQueueButton
             }
-            13 {
+            11 {
                 $btnAddToQueue.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
             }
-            15 {
+            13 {
                 Write-Log "[Info  ] [DEMO] Starting processing - watch the queue!"
                 $btnStart.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
                 $script:DemoTimer.Stop()  # Hand off to process timer
@@ -1992,6 +2470,36 @@ $script:Window.Add_Closed({
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize"
         FontFamily="Segoe UI" FontSize="13" Background="White">
+    <Window.Resources>
+        <Style x:Key="AcceptBtn" TargetType="Button">
+            <Setter Property="Background" Value="#107C10"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="3">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="#0E6E0E"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="#0A560A"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="bd" Property="Background" Value="#BFD9BF"/>
+                                <Setter Property="Foreground" Value="#F0F5F0"/>
+                                <Setter Property="Cursor" Value="Arrow"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
     <Border Padding="24,20">
         <StackPanel>
             <TextBlock Text="IMPORTANT NOTICE — PLEASE READ CAREFULLY"
@@ -2029,8 +2537,7 @@ Recommended: Review the source code in Start-CloudPCReplaceWPF.ps1 and CloudPCRe
                       FontWeight="SemiBold"/>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                 <Button x:Name="btnAccept" Content="Accept" Width="90" Height="32"
-                        Background="#107C10" Foreground="White" FontWeight="SemiBold"
-                        BorderThickness="0" Cursor="Hand" IsEnabled="False" Margin="0,0,8,0"/>
+                        Style="{StaticResource AcceptBtn}" IsEnabled="False" Margin="0,0,8,0"/>
                 <Button x:Name="btnDecline" Content="Decline" Width="90" Height="32"
                         Background="#E0E0E0" Foreground="#1F1F1F" BorderThickness="0"
                         Cursor="Hand"/>

@@ -26,7 +26,9 @@ This tool automates the entire replacement workflow:
 5. Monitors new Cloud PC provisioning
 6. Provides real-time progress tracking and error logging
 
-> ⚠️ **IMPORTANT:** This tool **reuses the same Windows 365 license**. The new Cloud PC will have the same size/SKU as the old one. This tool changes the provisioning profile (join type, network, region, image), not the license or size.
+> ⚠️ **IMPORTANT — This tool only changes Entra ID group memberships.** It does not touch licenses or provisioning policies directly. The whole workflow rests on one assumption: that your **provisioning policies are assigned to Entra groups**, so moving a user between groups triggers the Windows 365 service to deprovision the old Cloud PC and provision a new one. This tool simply watches for those service events to orchestrate the "destroy and redeploy."
+>
+> Because it only moves group membership, **it inherits (or forfeits) every other effect your groups have.** For example, if a group has *both* a provisioning policy **and** Cloud PC licenses assigned to it, moving the user can also change the new Cloud PC's **size/SKU** — not just its provisioning profile. Know what's attached to your source and target groups before you run a swap.
 
 ## Common Use Cases
 
@@ -41,8 +43,10 @@ This tool can be used to deprovision an existing Enterprise Cloud PC and then pr
 
 ## Features
 
-### Current Version (v5.0.1)
+### Current Version (v5.1.1)
 
+- ✅ **Scheduled Start/Pause** - Schedule the queue to begin at a set time (or after a delay) and optionally auto-pause, with live "Starts in" / "Pauses in" countdown chips and a proactive Graph token keep-alive
+- ✅ **Pause vs Stop Controls** - During a run, ▶ Start becomes ⏸ Pause (graceful drain: in-progress jobs finish, queued jobs hold and resume); ⏹ Stop is a hard stop with a confirmation prompt
 - ✅ **WPF GUI** - Modern WPF interface replacing the original WinForms script
 - ✅ **Policy-Aware Group Picker** - Source and Target groups auto-populated from Enterprise provisioning policies (no searching required)
 - ✅ **Multi-Select Source Groups** - Select multiple source groups; users from all selected groups merge into the users list
@@ -113,19 +117,19 @@ The GUI will let you search for groups by name - no need to look up Object IDs!
 
 ## Installation
 
-### 1. Clone or Download Repository
-```powershell
-cd C:\projects
-git clone https://github.com/yourusername/CloudPC-Replace.git
-cd CloudPC-Replace
-```
+1. Go to the [**Releases**](https://github.com/shannonfritz/CloudPC-Replace/releases/latest) page.
+2. Under **Assets**, download the **Source code (zip)** for the latest release.
+3. Extract the zip to a folder.
 
-### 2. Install Microsoft Graph PowerShell SDK
-```powershell
-Install-Module Microsoft.Graph -Scope CurrentUser -Force
-```
+> Prefer git? You can still clone the repo instead:
+> ```powershell
+> git clone https://github.com/shannonfritz/CloudPC-Replace.git
+> ```
 
-> **Note:** The GUI will prompt to install the module automatically if not found.
+> **Note — Microsoft Graph module:** The GUI will prompt to install the required `Microsoft.Graph` PowerShell SDK automatically if it isn't found. To install it manually ahead of time:
+> ```powershell
+> Install-Module Microsoft.Graph -Scope CurrentUser -Force
+> ```
 
 ## Usage
 
@@ -134,6 +138,8 @@ Install-Module Microsoft.Graph -Scope CurrentUser -Force
 ```powershell
 .\Start-CloudPCReplaceGUI.ps1
 ```
+
+Or simply **right-click `Start-CloudPCReplaceGUI.ps1` and select *Run with PowerShell***.
 
 ### Step-by-Step Workflow
 
@@ -465,6 +471,36 @@ If you encounter issues:
 This tool is provided as-is. Use at your own risk.
 
 ## Version History
+
+### v5.1.1 (2026-07-23)
+
+**Changed**
+- Reworked the run controls into a clear **Pause vs Stop** model:
+  - During a run, **▶ Start** becomes **⏸ Pause** — a graceful drain that lets in-progress jobs finish while holding queued jobs so you can resume later.
+  - **⏹ Stop** is now a hard stop and asks for confirmation when jobs are mid-flight (it freezes work immediately — use it only to abort).
+  - The scheduled auto-**pause** uses the graceful drain, and the Schedule dialog now says **Pause** throughout (checkbox, radios, summary, and the **⏸ Pauses in** countdown chip).
+
+**Fixed**
+- A completed job's **Messages** now shows **"Completed in XhYYmZZs"** instead of remaining stuck on "Started at…".
+- The **"Status flip-flop detected (API lag)"** advisory now actually shows in the grid while a job monitors deprovisioning (previously it was overwritten within the same refresh and never appeared).
+- A scheduled auto-pause "cap" that never triggered (because the queue finished first) is now cleared when the run ends, so it can't linger and pause a later, unrelated run.
+- The **Clear** button now removes finished/failed jobs as expected.
+
+**Developer**
+- Mock mode: shorter poll interval for quicker demos and a corrected self-driving demo sequence. Mock remains a best-effort demo aid and has no effect on real runs.
+
+### v5.1.0 (2026-07-08)
+
+**Added**
+- **Scheduled Start/Pause.** A new **⏱ Schedule** button opens a modal to arm the queue:
+  - **Start** either *at* a specific time (HH:mm, 24-hr — rolls to tomorrow if the time has already passed) or *in* a number of minutes/hours.
+  - Optional **Pause** either *at* a time or *in* a duration after the start. At the pause time the graceful-drain logic runs — in-progress jobs finish, no new jobs are dequeued.
+  - A live summary in the modal shows the resolved **Start**, **Pause**, and **Runtime** before you commit.
+  - Two countdown chips (**⏱ Starts in** / **⏸ Pauses in**) tick down in the stat strip while armed/running.
+  - **Cancel** a pending schedule with the **⏹ Stop** button; **▶ Start** while armed starts immediately (and preserves any scheduled pause).
+- **Graph token keep-alive.** While a start is armed, the app makes a lightweight authenticated Graph call every ~10 minutes to keep the connection warm, and surfaces an early warning if auth expires. A final pre-flight check runs at kickoff — if the connection is gone, the start aborts and jobs remain queued rather than failing.
+
+> ⚠️ **IMPORTANT:** Scheduling runs inside the app — the tool must stay open until the scheduled start time. It does not create a Windows Scheduled Task.
 
 ### v5.0.1 (2026-03-08)
 

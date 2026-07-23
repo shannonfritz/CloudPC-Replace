@@ -92,6 +92,7 @@ class UserReplaceState {
     [string]$OldCPCName = ""
     [string]$NewCPCName = ""
     [string]$FinalMessage = ""
+    [string]$StatusNote = ""  # Transient advisory shown in the grid while a job is in progress (e.g. API flip-flop)
 }
 #endregion
 
@@ -1288,6 +1289,7 @@ function Invoke-CloudPCReplaceStep {
                 $cloudPCs = Get-CloudPCForUser -UserId $State.UserPrincipalName
                 $trackedCPCs = @($cloudPCs | Where-Object { $State.CloudPCIds -contains $_.id })
                 
+                $State.StatusNote = ""  # cleared each poll; re-set below if the flip-flop is still occurring
                 $activeCPCs = @()
                 foreach ($cpc in $trackedCPCs) {
                     if ($cpc.status -eq 'notProvisioned') {
@@ -1314,6 +1316,7 @@ function Invoke-CloudPCReplaceStep {
                         
                         if ($State.DeprovisioningSeenCPCs.ContainsKey($cpc.id)) {
                             Write-StepLog "[Debug ] CPC $($cpc.id) flip-flopped back to inGracePeriod (seen deprovisioning before) - API inconsistency$statusInfo" "Debug" "Yellow"
+                            $State.StatusNote = "Status flip-flop detected (API lag)"
                             if ($OnGridUpdate) {
                                 & $OnGridUpdate $State "Messages" "Status flip-flop detected (API lag)"
                             }
